@@ -1,0 +1,545 @@
+---
+title: "Study 1 - prevalence with confidence intervals, and the paired sound vs sound+oral contrast"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr); library(tidyr); library(stringr); library(ggplot2); library(lme4)
+```
+
+# Purpose and standing
+
+Implements `ANALYSIS_PLAN.md` analyses **2** (Wilson intervals), **3** (exact McNemar), **4**
+(paired risk difference), **5** (binomial GLMM) and **6** (Benjamini-Hochberg).
+
+⚠️ **Standing.** The plan is `Status: draft - awaiting agreement`. Esther authorised these
+specific analyses by explicit request on 2026-08-17; the plan as a whole is still awaiting
+sign-off, and this script does not change that. Everything here is **retrospective and
+exploratory** — the data were collected, analysed and published before the plan existed.
+Nothing in this file may be described as pre-specified.
+
+The reconciliation that blocked inference has closed for every quantity used here: all
+prevalence figures and the 18/23 elimination endpoint rebuild exactly from raw. The two
+concordance analyses remain irreproducible and are untouched by this script.
+
+**Input** is `data/processed/participant_condition_long.csv`, the modelling substrate written
+by `collapse_conditions_and_classify.Rmd`. Run that first if it is missing.
+
+```{r load}
+proc <- file.path("..", "..", "data", "processed")
+f <- file.path(proc, "participant_condition_long.csv")
+if (!file.exists(f)) {
+  stop("participant_condition_long.csv not found. Run collapse_conditions_and_classify.Rmd first.")
+}
+
+long <- read.csv(f, stringsAsFactors = FALSE)
+n_p <- n_distinct(long$pid)
+
+stopifnot(nrow(long) == n_p * 23, all(long$any_vs %in% c(0, 1)))
+cat("participants:", n_p, " condition-level rows:", nrow(long), "\n")
+cat("blocks:", paste(names(table(long$block_type)), table(long$block_type), sep = "="), "\n")
+```
+
+# 1. Interval methods
+
+## Wilson score interval, for single proportions
+
+Chosen in the plan for the reasons recorded there: better coverage than Wald at n = 38,
+without Clopper-Pearson's conservatism, and it is the building block of the paired interval
+below, so single proportions and paired differences are constructed the same way.
+
+```{r wilson}
+wilson <- function(x, n, conf = 0.95) {
+  z  <- qnorm(1 - (1 - conf) / 2)
+  p  <- x / n
+  ctr  <- (p + z^2 / (2 * n)) / (1 + z^2 / n)
+  half <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / (1 + z^2 / n)
+  c(lower = max(0, ctr - half), upper = min(1, ctr + half))
+}
+
+# Verified against the worked example in ANALYSIS_PLAN.md: 23/38 -> [44.7, 74.4]
+chk <- round(100 * wilson(23, 38), 1)
+cat("check 23/38:", chk["lower"], "-", chk["upper"], " (plan says 44.7 - 74.4)\n")
+stopifnot(abs(chk["lower"] - 44.7) < 0.15, abs(chk["upper"] - 74.4) < 0.15)
+```
+
+## Newcombe's interval, for the paired difference
+
+Newcombe (1998) method 10 — square-and-add on the two Wilson intervals, with a correlation
+correction from the 2x2 table. Used because the two proportions come from the **same 38
+people**, so an interval that assumed independence would be too wide and would understate a
+real difference.
+
+```{r newcombe}
+# a = VS under both, b = VS under condition 1 only, c = VS under condition 2 only, d = neither
+newcombe_paired <- function(a, b, c, d, conf = 0.95) {
+  n  <- a + b + c + d
+  p1 <- (a + b) / n
+  p2 <- (a + c) / n
+  rd <- p1 - p2
+  w1 <- wilson(a + b, n, conf)
+  w2 <- wilson(a + c, n, conf)
+  A   <- (a + b) * (c + d) * (a + c) * (b + d)
+  phi <- if (A <= 0) 0 else (a * d - b * c) / sqrt(A)
+  l1 <- p1 - w1[["lower"]]; u1 <- w1[["upper"]] - p1
+  l2 <- p2 - w2[["lower"]]; u2 <- w2[["upper"]] - p2
+  c(rd    = rd,
+    lower = max(-1, rd - sqrt(l1^2 + u2^2 - 2 * phi * l1 * u2)),
+    upper = min( 1, rd + sqrt(u1^2 + l2^2 - 2 * phi * u1 * l2)))
+}
+```
+
+# 2. Prevalence with 95% Wilson intervals
+
+## ⚠️ Read the opportunity count before reading any interval
+
+Three of the proportions requested are **unions over several conditions** — "did this
+participant show a VS under *any* of them". A union has as many chances to be positive as it
+has conditions, so:
+
+- a union proportion is **not comparable** to the single sound-only proportion;
+- the COS union (3 stimuli) is **not comparable** to the DS union (8 stimuli);
+- the interval is a perfectly valid interval **for the union**, and a misleading one for
+  "the effect of an oral stimulus".
+
+This is the same structural problem as `ANALYSIS_PLAN.md` §2a.9, and it is why §5 of the plan
+declines Cochran's Q across phases. Every row below therefore carries `n_conditions`, and the
+per-stimulus rows — where every proportion rests on exactly one condition — are the ones that
+may be compared with each other. §5 answers the DS vs COS question properly instead.
+
+```{r prevalence}
+per_pid <- long |>
+  group_by(pid) |>
+  summarise(
+    vs_sound     = any_vs[block_type == "sound_only"],
+    vs_oral_any  = as.integer(any(any_vs[block_type == "oral_alone"] == 1)),
+    vs_oral_cos  = as.integer(any(any_vs[block_type == "oral_alone" & type == "COS"] == 1)),
+    vs_oral_ds   = as.integer(any(any_vs[block_type == "oral_alone" & type == "DS"] == 1)),
+    .groups = "drop"
+  )
+
+add_ci <- function(label, x, n, n_conditions, estimand) {
+  ci <- wilson(x, n)
+  tibble(quantity = label, x = x, n = n, n_conditions = n_conditions,
+         estimand = estimand,
+         pct = 100 * x / n, lower = 100 * ci[["lower"]], upper = 100 * ci[["upper"]])
+}
+
+prev_union <- bind_rows(
+  add_ci("VS under sound alone", sum(per_pid$vs_sound), n_p, 1, "single condition"),
+  add_ci("VS under any oral stimulus alone", sum(per_pid$vs_oral_any), n_p, 11, "union"),
+  add_ci("VS under any COS alone", sum(per_pid$vs_oral_cos), n_p, 3, "union"),
+  add_ci("VS under any DS alone",  sum(per_pid$vs_oral_ds),  n_p, 8, "union")
+)
+
+knitr::kable(prev_union, digits = 1,
+             caption = "Prevalence with 95% Wilson intervals. Rows differ in n_conditions and the union rows are not comparable to each other or to the sound row.")
+```
+
+## Per stimulus — the comparable set
+
+Every proportion here rests on one condition and 12 drawings, so these may be read against
+each other and against the sound-only row.
+
+```{r prevalence-per-stimulus}
+prev_stim <- long |>
+  filter(block_type != "sound_only") |>
+  group_by(block_type, type, oral) |>
+  summarise(x = sum(any_vs), n = n(), .groups = "drop") |>
+  rowwise() |>
+  mutate(ci_l = 100 * wilson(x, n)[["lower"]],
+         ci_u = 100 * wilson(x, n)[["upper"]],
+         pct  = 100 * x / n) |>
+  ungroup() |>
+  arrange(block_type, oral)
+
+knitr::kable(prev_stim, digits = 1,
+             caption = "Per-stimulus prevalence with 95% Wilson intervals, n = 38 each")
+```
+
+# 3. The regulador proportion, with intervals
+
+`regulador` = VS under sound alone, then **all 12** drawings clear once the oral stimulus is
+added. Its denominator is the 23 participants who showed a VS under sound alone — not 38.
+
+```{r regulador-ci}
+elig_reg  <- sum(per_pid$vs_sound == 1)
+elig_pert <- sum(per_pid$vs_sound == 0)
+
+roll <- long |>
+  filter(block_type == "oral_plus_sound") |>
+  group_by(pid) |>
+  summarise(any_reg  = any(classification == "regulador"),
+            any_pert = any(classification == "perturbador"), .groups = "drop")
+
+reg_ci  <- add_ci("Ever regulador (any of 11 stimuli)",  sum(roll$any_reg),  elig_reg,  11, "union")
+pert_ci <- add_ci("Ever perturbador (any of 11 stimuli)", sum(roll$any_pert), elig_pert, 11, "union")
+
+reg_stim <- long |>
+  filter(block_type == "oral_plus_sound") |>
+  group_by(oral, type) |>
+  summarise(reg = sum(classification == "regulador"), .groups = "drop") |>
+  rowwise() |>
+  mutate(n = elig_reg, pct = 100 * reg / n,
+         lower = 100 * wilson(reg, elig_reg)[["lower"]],
+         upper = 100 * wilson(reg, elig_reg)[["upper"]]) |>
+  ungroup()
+
+knitr::kable(bind_rows(reg_ci, pert_ci), digits = 1,
+             caption = "The two classification rollups, each on its own denominator")
+knitr::kable(reg_stim, digits = 1,
+             caption = paste0("Regulador per stimulus, out of the ", elig_reg,
+                              " participants with a VS under sound alone"))
+```
+
+⚠️ **`18/23` is a union over 11 stimuli, so its interval is for "eliminated by at least one of
+eleven", not for "eliminated by an oral stimulus".** The per-stimulus rows above are what a
+single stimulus achieves, and they are much lower. Both are in the table so the difference
+cannot be glossed.
+
+# 4. The comparison that actually answers the question
+
+The question is whether the probability of a VS **falls** when an oral stimulus is added to
+the sound. The regulador proportion cannot answer it:
+
+- It is **conditioned on** having a VS under sound, so its denominator is the 23, and it says
+  nothing about the 15 who did not.
+- It is a **one-directional** quantity. It counts improvement and is structurally blind to
+  worsening, which lands in `no clasificado`.
+- Comparing 78% (regulador, of 23) against 61% (VS under sound, of 38) compares two different
+  quantities on two different denominators pointing in two different directions. **That
+  comparison is not interpretable and must not appear in the paper.**
+
+The right comparison is the **paired within-participant contrast**, stimulus by stimulus:
+each participant contributes their own sound-only result and their own sound + oral result.
+The 2x2 of interest per stimulus is
+
+| | VS under sound + oral | no VS under sound + oral |
+|---|---|---|
+| **VS under sound alone** | a | b — *this is `regulador`* |
+| **no VS under sound alone** | c — *this is `perturbador`* | d |
+
+`b` and `c` are the discordant cells and they are the entire evidence about direction. Note
+that the classification already computed them: **`regulador` is cell b and `perturbador` is
+cell c.**
+
+- **Exact McNemar** tests whether b and c are balanced — i.e. whether change is equally likely
+  in both directions. Exact rather than asymptotic because the discordant counts are small.
+- **Paired risk difference** `(b − c)/n` with a Newcombe interval is the effect size a
+  clinician reads. Positive = the oral stimulus lowered VS prevalence.
+- **Benjamini-Hochberg** across the 11 stimuli, because they are repeated measurements on the
+  same people and Bonferroni's independence assumption would over-correct.
+
+```{r paired}
+pairs_dat <- long |>
+  filter(block_type == "oral_plus_sound") |>
+  transmute(pid, oral, type, vs_oral_snd = any_vs) |>
+  left_join(transmute(filter(long, block_type == "sound_only"), pid, vs_snd = any_vs),
+            by = "pid")
+
+contrasts <- pairs_dat |>
+  group_by(oral, type) |>
+  summarise(
+    a = sum(vs_snd == 1 & vs_oral_snd == 1),
+    b = sum(vs_snd == 1 & vs_oral_snd == 0),   # regulador
+    c = sum(vs_snd == 0 & vs_oral_snd == 1),   # perturbador
+    d = sum(vs_snd == 0 & vs_oral_snd == 0),
+    .groups = "drop"
+  ) |>
+  rowwise() |>
+  mutate(
+    n           = a + b + c + d,
+    discordant  = b + c,
+    p_sound     = 100 * (a + b) / n,
+    p_oral_snd  = 100 * (a + c) / n,
+    rd          = 100 * newcombe_paired(a, b, c, d)[["rd"]],
+    rd_lower    = 100 * newcombe_paired(a, b, c, d)[["lower"]],
+    rd_upper    = 100 * newcombe_paired(a, b, c, d)[["upper"]],
+    # exact McNemar == binomial test of b out of the b+c discordant pairs against 0.5
+    p_exact     = if (discordant == 0) NA_real_ else binom.test(b, discordant, 0.5)$p.value,
+    prop_improve = if (discordant == 0) NA_real_ else 100 * b / discordant
+  ) |>
+  ungroup() |>
+  mutate(p_bh = p.adjust(p_exact, method = "BH")) |>
+  arrange(oral)
+
+# the classification counts must BE the discordant cells; if not, one script is wrong
+stopifnot(all(contrasts$n == n_p))
+
+knitr::kable(
+  contrasts |> select(oral, type, a, b, c, d, discordant, p_sound, p_oral_snd,
+                      rd, rd_lower, rd_upper, prop_improve, p_exact, p_bh),
+  digits = c(0,0,0,0,0,0,0,1,1,1,1,1,1,3,3),
+  caption = "Paired contrast, sound alone vs that stimulus with the sound maintained. b = regulador, c = perturbador. RD > 0 means the oral stimulus lowered VS prevalence."
+)
+
+cat("\nstimuli with BH-adjusted p < .05:", sum(contrasts$p_bh < 0.05, na.rm = TRUE),
+    "of", nrow(contrasts), "\n")
+cat("raw p < .05:", sum(contrasts$p_exact < 0.05, na.rm = TRUE), "\n")
+cat("discordant pairs per stimulus, range:", min(contrasts$discordant), "-",
+    max(contrasts$discordant), "\n")
+cat("risk difference range:", round(min(contrasts$rd), 1), "to",
+    round(max(contrasts$rd), 1), "percentage points\n")
+```
+
+# 5. Pooled models
+
+One estimate across all eleven stimuli, with participant and stimulus modelled as random
+effects so the repeated measurements are not treated as independent. This is the substantive
+answer to the reviewer's sample-size point: the manuscript collapses a 10,488-cell grid to one
+binary per person per phase, and that collapse is what makes the study look thin.
+
+```{r glmm-contrast}
+mod_dat <- long |>
+  filter(block_type %in% c("sound_only", "oral_plus_sound")) |>
+  mutate(oral_present = as.integer(block_type == "oral_plus_sound"),
+         stim_lab = if_else(block_type == "sound_only", "none", oral))
+
+cat("rows:", nrow(mod_dat), " (", n_p, "sound +", n_p * 11, "sound+oral )\n")
+
+m1 <- glmer(any_vs ~ oral_present + (1 | pid) + (1 | stim_lab),
+            data = mod_dat, family = binomial)
+
+cat("singular fit:", isSingular(m1), "\n")
+print(summary(m1)$varcor)
+
+est <- summary(m1)$coefficients["oral_present", ]
+or  <- exp(est[["Estimate"]])
+lo  <- exp(est[["Estimate"]] - 1.96 * est[["Std. Error"]])
+hi  <- exp(est[["Estimate"]] + 1.96 * est[["Std. Error"]])
+cat(sprintf("\nAdding an oral stimulus to the sound: OR = %.2f [%.2f, %.2f], p = %.3f\n",
+            or, lo, hi, est[["Pr(>|z|)"]]))
+```
+
+## DS versus COS, under the oral stimuli alone
+
+The proportions in §2 cannot answer this — the DS union has eight chances and the COS union
+three. A model can, because the number of stimuli enters as the number of rows rather than as
+the number of opportunities.
+
+```{r glmm-type}
+type_dat <- filter(long, block_type == "oral_alone")
+
+m2 <- glmer(any_vs ~ type + (1 | pid) + (1 | oral),
+            data = type_dat, family = binomial)
+
+cat("singular fit:", isSingular(m2), "\n")
+est2 <- summary(m2)$coefficients[2, ]
+cat(sprintf("DS vs COS (oral alone): OR = %.2f [%.2f, %.2f], p = %.3f\n",
+            exp(est2[["Estimate"]]),
+            exp(est2[["Estimate"]] - 1.96 * est2[["Std. Error"]]),
+            exp(est2[["Estimate"]] + 1.96 * est2[["Std. Error"]]),
+            est2[["Pr(>|z|)"]]))
+cat("\nNote: 3 COS levels and 8 DS levels. A variance component on 11 levels is weakly\n",
+    "identified, and on 3 levels it would not be estimable at all - which is why stimulus\n",
+    "type is a fixed effect here and stimulus identity the random one.\n")
+```
+
+# 6. Figure
+
+## Form and colour decisions
+
+**Dots with intervals, not bars with error bars.** At n = 38 the interval width *is* the
+result; a bar makes the eye read the filled area and the bar top as "the" value and demotes
+the interval to decoration. Bars also imply accumulation from zero, which a prevalence with an
+interval does not.
+
+**One hue.** These are one measure across several conditions, so no colour is spent
+re-encoding what the axis labels already say. Panels separate the two estimand types, which is
+the distinction that actually changes how a row may be read.
+
+```{r figure, fig.width=9, fig.height=6.5, dpi=300}
+col_point <- "#2a78d6"
+surface   <- "#fcfcfb"
+ink_muted <- "#898781"
+ink_prim  <- "#0b0b0b"
+
+# Manuscript wording for the row labels, and the opportunity count carried in the label of
+# every union row so a reader cannot miss it. The internal `quantity` strings are untouched --
+# the CSV keys off them.
+union_label <- c(
+  "VS under sound alone"             = "Sound alone",
+  "VS under any COS alone"           = "Any COS (3 conditions)",
+  "VS under any DS alone"            = "Any DS (8 conditions)",
+  "VS under any oral stimulus alone" = "Any OPS (11 conditions)"
+)
+
+stim_labels <- prev_stim |>
+  filter(block_type == "oral_alone") |>
+  transmute(label = paste0(oral, " (", type, ")")) |>
+  pull(label)
+
+fig_dat <- bind_rows(
+  prev_union |>
+    transmute(label = unname(union_label[quantity]), pct, lower, upper, n_conditions,
+              panel = if_else(n_conditions == 1, "One condition", "A union")),
+  prev_stim |>
+    filter(block_type == "oral_alone") |>
+    transmute(label = paste0(oral, " (", type, ")"),
+              pct, lower = ci_l, upper = ci_u, n_conditions = 1,
+              panel = "One condition")
+) |>
+  mutate(
+    label = factor(label, levels = rev(c(
+      "Sound alone", stim_labels,
+      "Any COS (3 conditions)", "Any DS (8 conditions)", "Any OPS (11 conditions)"))),
+    panel = factor(panel, levels = c("One condition", "A union"))
+  )
+
+stopifnot(!any(is.na(fig_dat$label)))
+
+p_ci <- ggplot(fig_dat, aes(pct, label)) +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0, linewidth = 0.9,
+                 colour = col_point) +
+  geom_point(size = 2.6, colour = col_point) +
+  # Labels sit past the interval's upper end, not on the point - anchored to the point they
+  # print straight over the interval line.
+  geom_text(aes(x = upper, label = sprintf("%.0f%% [%.0f, %.0f]", pct, lower, upper)),
+            hjust = -0.12, size = 2.5, colour = ink_muted) +
+  facet_grid(panel ~ ., scales = "free_y", space = "free_y") +
+  scale_x_continuous(limits = c(0, 132), breaks = seq(0, 100, 20),
+                     labels = paste0(seq(0, 100, 20), "%")) +
+  labs(
+    title    = "Prevalence of visual pseudo-scotomas with 95% confidence intervals",
+    subtitle = paste0("n = ", n_p, " participants. Sound alone, and each oral proprioceptive ",
+                      "stimulus presented without sound.\nThe two panels hold different kinds ",
+                      "of quantity and are not read across."),
+    x = "Participants with a pseudo-scotoma", y = NULL,
+    caption = paste0(
+      "COS = combined oral stimuli; DS = dental stimuli. Intervals are Wilson score intervals ",
+      "and quantify sampling uncertainty only; the\n",
+      "test-retest reliability of the outcome was not measured in this study.\n",
+      "Upper panel: each row is a single condition with one opportunity for a pseudo-scotoma ",
+      "to be recorded, so the rows are directly\n",
+      "comparable. Every individual oral stimulus produced a pseudo-scotoma in fewer ",
+      "participants than sound did (34.2% to 55.3% against\n",
+      "60.5%).\n",
+      "Lower panel: each row combines 3, 8 or 11 conditions and therefore had that many ",
+      "opportunities to be positive. These rows are not\n",
+      "comparable with each other or with the sound condition, and the higher value of 81.6% ",
+      "reflects the number of conditions combined\n",
+      "rather than a stronger effect of oral stimulation.\n",
+      "All analyses are retrospective and exploratory."
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(colour = "#e8e6e2", linewidth = 0.3),
+    strip.text.y       = element_text(colour = ink_prim, face = "bold", size = 8, angle = 0),
+    axis.text          = element_text(colour = ink_muted),
+    axis.title         = element_text(colour = ink_muted, size = 9),
+    plot.title         = element_text(colour = ink_prim, face = "bold", size = 12),
+    plot.subtitle      = element_text(colour = ink_muted, size = 8.5),
+    plot.caption       = element_text(colour = ink_muted, size = 7, hjust = 0),
+    plot.background    = element_rect(fill = surface, colour = NA)
+  )
+p_ci
+
+fig <- file.path("..", "outputs", "figures")
+dir.create(fig, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(fig, "prevalence_with_ci.png"), p_ci,
+       width = 9, height = 6.5, dpi = 300, bg = surface)
+```
+
+## The paired contrast, plotted against zero
+
+This is the figure the research question actually asks for: for each stimulus, how far the
+VS prevalence moved when the oral stimulus was added to the sound, with the uncertainty on that
+movement. A reduction would sit to the right of the zero line with an interval clear of it.
+
+```{r figure-forest, fig.width=9, fig.height=5, dpi=300}
+forest_dat <- contrasts |>
+  mutate(lab = paste0(oral, " (", type, ")   b=", b, " c=", c),
+         lab = factor(lab, levels = rev(lab)))
+
+p_forest <- ggplot(forest_dat, aes(rd, lab)) +
+  geom_vline(xintercept = 0, colour = "#b8b5ae", linewidth = 0.6) +
+  geom_errorbarh(aes(xmin = rd_lower, xmax = rd_upper), height = 0, linewidth = 0.9,
+                 colour = col_point) +
+  geom_point(size = 2.6, colour = col_point) +
+  geom_text(aes(x = rd_upper, label = sprintf("%+.0f [%+.0f, %+.0f]", rd, rd_lower, rd_upper)),
+            hjust = -0.12, size = 2.5, colour = ink_muted) +
+  scale_x_continuous(limits = c(-32, 62), breaks = seq(-30, 40, 10)) +
+  labs(
+    title    = "Change in pseudo-scotoma prevalence when an oral stimulus is added to the sound",
+    subtitle = paste0("Paired risk difference per stimulus, with 95% Newcombe intervals. ",
+                      "n = ", n_p, ", each participant contributing their own\nsound-only ",
+                      "result. b = participants who improved (regulador), c = participants ",
+                      "who worsened (perturbador)."),
+    x = "Percentage-point change in prevalence   (right = oral stimulus lowered it)", y = NULL,
+    caption = paste0(
+      "Every interval crosses zero. Exact McNemar p ranged from .24 to 1.00; after ",
+      "Benjamini-Hochberg across the 11 stimuli, all adjusted p = 1.00.\n",
+      "The intervals are about 40 percentage points wide, so this is an uninformative result ",
+      "rather than a demonstration of no effect: a\n",
+      "worthwhile reduction and a worthwhile increase are both still compatible with these ",
+      "data.\n",
+      "Note b and c are close to equal throughout - improvement and worsening were about ",
+      "equally common, which is what 18/23 conceals.\n",
+      "Retrospective and exploratory. Values in outputs/tables/paired_contrasts.csv"
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(colour = "#e8e6e2", linewidth = 0.3),
+    axis.text          = element_text(colour = ink_muted),
+    axis.text.y        = element_text(family = "mono", size = 8),
+    axis.title         = element_text(colour = ink_muted, size = 9),
+    plot.title         = element_text(colour = ink_prim, face = "bold", size = 11.5),
+    plot.subtitle      = element_text(colour = ink_muted, size = 8.5),
+    plot.caption       = element_text(colour = ink_muted, size = 7, hjust = 0),
+    plot.background    = element_rect(fill = surface, colour = NA)
+  )
+p_forest
+
+ggsave(file.path(fig, "paired_risk_difference_forest.png"), p_forest,
+       width = 9, height = 5, dpi = 300, bg = surface)
+```
+
+# 7. Outputs
+
+```{r write}
+tab <- file.path("..", "outputs", "tables")
+dir.create(tab, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  bind_rows(
+    prev_union,
+    prev_stim |> transmute(quantity = paste0(oral, " (", block_type, ", ", type, ")"),
+                           x, n, n_conditions = 1, estimand = "single condition",
+                           pct, lower = ci_l, upper = ci_u),
+    reg_ci, pert_ci,
+    reg_stim |> transmute(quantity = paste0("regulador: ", oral, " (", type, ")"),
+                          x = reg, n, n_conditions = 1, estimand = "single condition",
+                          pct, lower, upper)
+  ),
+  file.path(tab, "prevalence_ci.csv"), row.names = FALSE)
+
+write.csv(contrasts, file.path(tab, "paired_contrasts.csv"), row.names = FALSE)
+
+write.csv(
+  data.frame(
+    model = c("sound vs sound+oral", "DS vs COS (oral alone)"),
+    term  = c("oral_present", "typeDS"),
+    or    = c(or, exp(est2[["Estimate"]])),
+    lower = c(lo, exp(est2[["Estimate"]] - 1.96 * est2[["Std. Error"]])),
+    upper = c(hi, exp(est2[["Estimate"]] + 1.96 * est2[["Std. Error"]])),
+    p     = c(est[["Pr(>|z|)"]], est2[["Pr(>|z|)"]]),
+    singular = c(isSingular(m1), isSingular(m2))
+  ),
+  file.path(tab, "glmm_estimates.csv"), row.names = FALSE)
+
+cat("wrote prevalence_ci.csv, paired_contrasts.csv, glmm_estimates.csv\n")
+```
+
+```{r session}
+sessionInfo()
+```

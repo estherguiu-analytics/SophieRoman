@@ -1,0 +1,319 @@
+---
+title: "Study 1 - reconciliation of published counts"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(readxl); library(dplyr); library(tidyr); library(purrr); library(stringr)
+```
+
+# Purpose
+
+The manuscript's counts and the Spanish recount (`RESULTADOS YOLANDA. TFG Agusti.docx`)
+disagree. This script rebuilds every published number from the raw Excel so the three can be
+compared. **No inferential statistics are run here and none may be run until this closes.**
+
+Where a definition in the paper is ambiguous, every plausible reading is computed rather than
+one being chosen -- the disagreements are far more likely to be definitional than arithmetic.
+
+# Load
+
+```{r load}
+raw_dir <- file.path("..", "..", "data", "raw")
+xl <- list.files(raw_dir, pattern = "\\.xlsx$", full.names = TRUE)
+stopifnot(length(xl) == 1)
+
+# Row 1 of the sheet is a merged group header; row 2 carries the column names.
+d <- read_excel(xl, sheet = "Datos", skip = 1)
+names(d)[1] <- "row_index"
+names(d)[2] <- "pid"
+names(d)[3] <- "sex"
+names(d)[4] <- "age"
+
+cat("participants:", nrow(d), " columns:", ncol(d), "\n")
+cat("sex 1=male, 2=female:", paste(names(table(d$sex)), table(d$sex), sep = "="), "\n")
+cat("age: mean", round(mean(d$age), 1), "SD", round(sd(d$age), 1),
+    "range", min(d$age), "-", max(d$age), "\n")
+
+grid_cols <- names(d)[5:ncol(d)]
+stopifnot(length(grid_cols) == 23 * 12)
+stopifnot(all(unlist(d[grid_cols]) %in% c(0, 1)))
+cat("outcome grid:", length(grid_cols), "binary columns, no missing values\n")
+```
+
+## Long form: one row per participant x stimulus x drawing
+
+```{r long}
+long <- d |>
+  select(pid, sex, age, all_of(grid_cols)) |>
+  pivot_longer(all_of(grid_cols), names_to = "cell", values_to = "vs") |>
+  mutate(
+    im  = as.integer(str_match(cell, "^IM(\\d+) ")[, 2]),
+    e   = as.integer(str_match(cell, " E(\\d+)$")[, 2]),
+    with_sound = e >= 1 & e <= 12,
+    stim = case_when(
+      e == 1 ~ "sound_only",
+      e %in% 2:4   ~ "COS", e %in% 13:15 ~ "COS",
+      e %in% 5:12  ~ "DS",  e %in% 16:23 ~ "DS"
+    ),
+    # the same oral stimulus, with and without sound, shares a label
+    oral = case_when(
+      e %in% c(2, 13) ~ "M1", e %in% c(3, 14) ~ "M2", e %in% c(4, 15) ~ "M3",
+      e %in% c(5, 16) ~ "11V", e %in% c(6, 17) ~ "21V",
+      e %in% c(7, 18) ~ "31V", e %in% c(8, 19) ~ "41V",
+      e %in% c(9, 20) ~ "11P", e %in% c(10, 21) ~ "21P",
+      e %in% c(11, 22) ~ "31L", e %in% c(12, 23) ~ "41L",
+      TRUE ~ NA_character_
+    )
+  )
+
+stopifnot(nrow(long) == 38 * 23 * 12)
+
+# per participant x stimulus: was there a VS anywhere, and in which drawings
+by_stim <- long |>
+  group_by(pid, e, stim, oral, with_sound) |>
+  summarise(any_vs = as.integer(any(vs == 1)),
+            n_im   = sum(vs),
+            set_im = paste(sort(im[vs == 1]), collapse = ","),
+            .groups = "drop")
+
+cat("stimulus-level rows:", nrow(by_stim), "\n")
+```
+
+# 1. Prevalence
+
+```{r prevalence}
+p <- by_stim |>
+  group_by(pid) |>
+  summarise(
+    vs_sound       = any(e == 1 & any_vs == 1),
+    vs_ops_alone   = any(e %in% 13:23 & any_vs == 1),   # phase 4: OPS, no sound
+    vs_ops_wsound  = any(e %in% 2:12  & any_vs == 1),   # phase 3: OPS + sound
+    vs_ops_either  = vs_ops_alone | vs_ops_wsound,
+    .groups = "drop"
+  )
+
+prev <- function(ops) {
+  tibble(
+    sound_only  = sum(p$vs_sound & !ops),
+    ops_only    = sum(!p$vs_sound & ops),
+    both        = sum(p$vs_sound & ops),
+    neither     = sum(!p$vs_sound & !ops),
+    any_vs      = sum(p$vs_sound | ops),
+    n_sound     = sum(p$vs_sound),
+    n_ops       = sum(ops)
+  )
+}
+
+cat("--- OPS read as phase 4 only (E13-E23) ---\n"); print(prev(p$vs_ops_alone))
+cat("--- OPS read as any oral stimulus (E2-E23) ---\n"); print(prev(p$vs_ops_either))
+```
+
+# 2. Elimination of sound-induced VS
+
+The paper's headline: of those with VS under sound alone, how many had it *eliminated* by an
+oral stimulus applied while the sound continued? "Elimination" in the recount is
+*recuperan la linea entera* -- the whole line returns, i.e. **no VS in any of the 12
+drawings** for that stimulus.
+
+```{r elimination}
+resp <- p |> filter(vs_sound) |> pull(pid)
+cat("participants with sound-induced VS:", length(resp), "\n")
+
+elim <- by_stim |>
+  filter(pid %in% resp, e %in% 2:12) |>          # phase 3: OPS *with* sound maintained
+  group_by(pid) |>
+  summarise(
+    by_COS = any(stim == "COS" & any_vs == 0),
+    by_DS  = any(stim == "DS"  & any_vs == 0),
+    .groups = "drop"
+  ) |>
+  mutate(any_elim = by_COS | by_DS)
+
+cat("eliminated by any OPS:", sum(elim$any_elim), "of", nrow(elim), "\n")
+cat("  DS only :", sum(elim$by_DS & !elim$by_COS), "\n")
+cat("  COS only:", sum(elim$by_COS & !elim$by_DS), "\n")
+cat("  both    :", sum(elim$by_DS & elim$by_COS), "\n")
+```
+
+# 3. Spatial concordance (sound vs oral stimuli)
+
+⚠️ **Added 2026-08-17 — the "manuscript" figures in this section and the next could not be
+verified against the draft on disk, and the numbers below are left unchanged pending Sophie.**
+
+The draft (`Manuscript/drafts/…-EGH.docx`) was read in full on 2026-08-17. It contains
+**exactly one** concordance analysis — the anatomical COS↔DS one, in Results ¶178, reported as
+**5 complete / 3 partial / 3 none**. Two consequences:
+
+1. This section's "paper reports 12 exact / 5 partial / 3 none" **is not in the draft.** No
+   same-drawings concordance analysis appears in it at all. Either it was in the submitted
+   version (which is not on disk — see `Manuscript/MANUSCRIPT.md`), or it was mis-attributed
+   here.
+2. Section 4's "manuscript 4 / 5 / 3" for COS–DS **contradicts the draft's 5 / 3 / 3.** The
+   Spanish recount also says 5/3/3, and Reviewer 1's letter quotes 5/3/3. So three independent
+   sources agree, and the 4/5/3 recorded here looks like a transcription error.
+
+The hardcoded values are deliberately **not** corrected, because it cannot be ruled out that a
+previous session read the submitted file. Ask Sophie which version these came from, then fix
+this table in one edit. Tracked as open item 8 in `../../CLAUDE.md`.
+
+Among participants with VS under **both** sound and oral stimulation, does the VS occupy the
+same drawings? The paper reports 12 exact / 5 partial / 3 none; the recount reports 2 / 12 / 6.
+
+"Partial" is defined in the recount as agreement on **at least 50% of the drawings**, matched
+against **at least one** oral stimulus. Fifty percent *of what* is not stated, so both
+denominators are computed.
+
+```{r concordance-spatial}
+sound_sets <- by_stim |> filter(e == 1, any_vs == 1) |> select(pid, sound_set = set_im)
+
+both_pids <- p |> filter(vs_sound, vs_ops_alone) |> pull(pid)
+cat("participants with VS under both sound and OPS-alone:", length(both_pids), "\n")
+
+jacc <- by_stim |>
+  filter(pid %in% both_pids, e %in% 13:23, any_vs == 1) |>
+  inner_join(sound_sets, by = "pid") |>
+  rowwise() |>
+  mutate(
+    a = list(strsplit(sound_set, ",")[[1]]),
+    b = list(strsplit(set_im, ",")[[1]]),
+    inter = length(intersect(a, b)),
+    exact = identical(sort(a), sort(b)),
+    frac_of_sound = inter / length(a),
+    frac_of_union = inter / length(union(a, b))
+  ) |>
+  ungroup()
+
+classify <- function(df, frac_col) {
+  df |>
+    group_by(pid) |>
+    summarise(
+      any_exact = any(exact),
+      best      = max(.data[[frac_col]]),
+      .groups   = "drop"
+    ) |>
+    mutate(cat = case_when(any_exact ~ "exact",
+                           best >= 0.5 ~ "partial",
+                           TRUE ~ "none"))
+}
+
+for (fc in c("frac_of_sound", "frac_of_union")) {
+  cat("\n--- overlap as a fraction of", fc, "---\n")
+  print(table(classify(jacc, fc)$cat))
+}
+```
+
+# 4. Concordance of effect between COS and DS
+
+Among those who eliminated the sound-induced VS with **both** COS and DS, do anatomically
+equivalent stimuli agree? The paper's mapping (Fig. 2): M1 ~ palatal traction on 1.1/2.1;
+M2 ~ buccal pressure on 1.1/2.1/3.1/4.1; M3 ~ lingual traction on 3.1/4.1.
+
+```{r concordance-cosds}
+equiv <- list(M1 = c("11P", "21P"),
+              M2 = c("11V", "21V", "31V", "41V"),
+              M3 = c("31L", "41L"))
+
+both_pids2 <- elim |> filter(by_COS, by_DS) |> pull(pid)
+cat("eliminated with both COS and DS:", length(both_pids2), "\n")
+
+# elimination response per oral stimulus, phase 3 (sound maintained)
+er <- by_stim |>
+  filter(pid %in% both_pids2, e %in% 2:12) |>
+  mutate(eliminated = any_vs == 0) |>
+  select(pid, oral, eliminated)
+
+pairs <- map_dfr(names(equiv), function(m) {
+  er |>
+    filter(oral == m) |>
+    select(pid, cos_elim = eliminated) |>
+    left_join(
+      er |> filter(oral %in% equiv[[m]]) |>
+        group_by(pid) |>
+        summarise(ds_elim = any(eliminated), .groups = "drop"),
+      by = "pid"
+    ) |>
+    mutate(cos = m, match = cos_elim == ds_elim)
+})
+
+cosds <- pairs |>
+  group_by(pid) |>
+  summarise(n_match = sum(match), n = n(), .groups = "drop") |>
+  mutate(cat = case_when(n_match == n ~ "total",
+                         n_match == 0 ~ "none",
+                         TRUE ~ "partial"))
+print(table(cosds$cat))
+```
+
+# 5. Reconciliation table
+
+```{r reconcile}
+rebuild <- prev(p$vs_ops_alone)
+sp_sound <- table(classify(jacc, "frac_of_sound")$cat)
+sp_union <- table(classify(jacc, "frac_of_union")$cat)
+cd <- table(cosds$cat)
+g <- function(tb, k) if (k %in% names(tb)) as.integer(tb[[k]]) else 0L
+
+rec <- tribble(
+  ~number,                              ~manuscript, ~recount, ~rebuild,
+  "No VS under any condition",                   4L,       4L, rebuild$neither,
+  "Any VS",                                     34L,      34L, rebuild$any_vs,
+  "VS with sound (E1)",                         23L,      23L, rebuild$n_sound,
+  "VS with OPS",                                31L,      31L, rebuild$n_ops,
+  "VS with sound only",                          3L,       3L, rebuild$sound_only,
+  "VS with OPS only",                           11L,      11L, rebuild$ops_only,
+  "VS with both",                               20L,      20L, rebuild$both,
+  "Elimination of sound-induced VS",            18L,      18L, sum(elim$any_elim),
+  "  ...with DS only",                           6L,       5L, sum(elim$by_DS & !elim$by_COS),
+  "  ...with COS only",                          1L,       2L, sum(elim$by_COS & !elim$by_DS),
+  "  ...with both",                             11L,      11L, sum(elim$by_DS & elim$by_COS),
+  "Spatial concordance: exact",                 12L,       2L, g(sp_sound, "exact"),
+  "Spatial concordance: partial",                5L,      12L, g(sp_sound, "partial"),
+  "Spatial concordance: none",                   3L,       6L, g(sp_sound, "none"),
+  "COS-DS concordance: total",                   4L,       5L, g(cd, "total"),
+  "COS-DS concordance: partial",                 5L,       3L, g(cd, "partial"),
+  "COS-DS concordance: none",                    3L,       3L, g(cd, "none")
+) |>
+  mutate(
+    agrees_with = case_when(
+      rebuild == manuscript & rebuild == recount ~ "both",
+      rebuild == manuscript ~ "manuscript",
+      rebuild == recount    ~ "recount",
+      TRUE ~ "NEITHER"
+    )
+  )
+
+print(as.data.frame(rec), row.names = FALSE)
+
+cat("\nSpatial concordance under the alternative denominator (union):\n")
+print(sp_union)
+
+out <- file.path("..", "outputs", "tables")
+dir.create(out, recursive = TRUE, showWarnings = FALSE)
+write.csv(rec, file.path(out, "reconciliation.csv"), row.names = FALSE)
+```
+
+# 6. Two structural absences
+
+```{r absences}
+cat("Phase 1 (no stimuli) columns present in the file:",
+    sum(grepl(" E0$", grid_cols)), "\n")
+cat("Times the sound-only condition was measured:",
+    length(unique(by_stim$e[by_stim$e == 1])), "\n")
+```
+
+Neither is a coding problem; both are limits of what was recorded.
+
+- **No baseline column.** The paper's "no participant reported VS in the absence of stimuli"
+  is not in this file.
+- **The sound-only condition was measured once.** Within-session stability of the outcome is
+  therefore not estimable, and the elimination endpoint in section 2 cannot be separated from
+  ordinary response instability.
+
+```{r session}
+sessionInfo()
+```

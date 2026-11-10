@@ -1,0 +1,395 @@
+---
+title: "Study 1 - participant x stimulus matrices and descriptive heatmaps"
+output:
+  html_document:
+    toc: true
+params:
+  sort_participants: "sound"   # "sound", "burden", or "id" -- see the ordering chunk
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(readxl); library(dplyr); library(tidyr); library(stringr); library(ggplot2)
+```
+
+# Purpose
+
+Two derived datasets and a look at each:
+
+1. **Binary** — did this participant report a visual pseudo-scotoma anywhere under this
+   stimulus? One yes/no per participant x stimulus, collapsed across the 12 drawings.
+2. **Count** — how many of the 12 drawings were affected? 0 to 12.
+
+Descriptive only. No hypothesis is tested here.
+
+# Colour decisions
+
+Recorded because they are choices, not defaults.
+
+**Binary: light neutral for absent, blue for present.** Not red/green. Red/green measures a
+CVD separation of dE 7.2 under protanopia, which sits in the 6-8 warning band -- roughly one
+man in twelve could not reliably tell the two states apart, on a figure whose entire job is
+telling two states apart. Neutral vs blue measures dE 37.8 under the same simulation, and
+separates on lightness as well as hue, so it survives greyscale printing too.
+
+**Count: one blue hue, light to dark.** Never a rainbow. Zero is held out in the same neutral
+as the binary figure, so "nothing happened" reads as nothing rather than as the bottom of a
+scale.
+
+The CSVs written below are the table view for both figures, so no value is reachable only by
+colour.
+
+```{r palette}
+col_absent  <- "#f0efec"   # neutral - reads as "nothing"
+col_present <- "#2a78d6"   # blue, categorical slot 1
+ramp_blue   <- c("#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5",
+                 "#256abf", "#184f95", "#0d366b")
+surface     <- "#fcfcfb"
+ink_muted   <- "#898781"
+ink_primary <- "#0b0b0b"
+```
+
+# Load and reshape
+
+```{r load}
+raw_dir <- file.path("..", "..", "data", "raw")
+xl <- list.files(raw_dir, pattern = "\\.xlsx$", full.names = TRUE)
+stopifnot(length(xl) == 1)
+
+# The workbook is often open in Excel, and then cannot be read in place by any ordinary
+# route. readable_copy() falls through three of them; see src/readable_copy.R.
+source("readable_copy.R")
+
+d <- read_excel(readable_copy(xl), sheet = "Datos", skip = 1)
+names(d)[1:4] <- c("row_index", "pid", "sex", "age")
+grid_cols <- names(d)[5:ncol(d)]
+stopifnot(length(grid_cols) == 23 * 12, all(unlist(d[grid_cols]) %in% c(0, 1)))
+```
+
+Stimulus labels, from the workbook's `Variables` sheet. `E1` is sound alone; `E2`-`E12` are
+the eleven oral stimuli with sound; `E13`-`E23` are the same eleven without it.
+
+```{r labels}
+oral <- c("M1", "M2", "M3", "11V", "21V", "31V", "41V", "11P", "21P", "31L", "41L")
+
+stim <- tibble(
+  e     = 1:23,
+  label = c("Sound", oral, oral),
+  phase = factor(c("Sound alone", rep("Oral + sound", 11), rep("Oral alone", 11)),
+                 levels = c("Sound alone", "Oral + sound", "Oral alone")),
+  type  = c("Sound", rep(c(rep("COS", 3), rep("DS", 8)), 2))
+)
+
+long <- d |>
+  select(pid, all_of(grid_cols)) |>
+  pivot_longer(-pid, names_to = "cell", values_to = "vs") |>
+  mutate(im = as.integer(str_match(cell, "^IM(\\d+) ")[, 2]),
+         e  = as.integer(str_match(cell, " E(\\d+)$")[, 2])) |>
+  left_join(stim, by = "e")
+
+stopifnot(nrow(long) == 38 * 23 * 12)
+```
+
+# The two matrices
+
+```{r matrices}
+by_stim <- long |>
+  group_by(pid, e, label, phase, type) |>
+  summarise(n_vs = sum(vs), any_vs = as.integer(n_vs > 0), .groups = "drop")
+
+# Wide, one row per participant, for reading in Excel
+col_names <- paste0("E", stim$e, "_", str_replace_all(stim$label, " ", "_"),
+                    ifelse(stim$phase == "Oral + sound" , "_snd", ""))
+
+to_wide <- function(value_col) {
+  by_stim |>
+    select(pid, e, val = all_of(value_col)) |>
+    pivot_wider(names_from = e, values_from = val, names_sort = TRUE) |>
+    rename_with(~ col_names, .cols = -pid) |>
+    arrange(pid)
+}
+
+vs_binary <- to_wide("any_vs")
+vs_count  <- to_wide("n_vs")
+
+proc <- file.path("..", "..", "data", "processed")
+dir.create(proc, recursive = TRUE, showWarnings = FALSE)
+write.csv(vs_binary, file.path(proc, "vs_binary_participant_by_stimulus.csv"), row.names = FALSE)
+write.csv(vs_count,  file.path(proc, "vs_count_participant_by_stimulus.csv"),  row.names = FALSE)
+
+cat("binary:", nrow(vs_binary), "x", ncol(vs_binary), " count:",
+    nrow(vs_count), "x", ncol(vs_count), "\n")
+cat("total stimulus-level VS:", sum(by_stim$any_vs), "of", nrow(by_stim), "\n")
+cat("count range:", min(by_stim$n_vs), "-", max(by_stim$n_vs), "\n")
+```
+
+```{r peek}
+knitr::kable(vs_binary[1:5, 1:8], caption = "Binary matrix, first 5 participants")
+knitr::kable(vs_count[1:5, 1:8],  caption = "Count matrix, first 5 participants")
+```
+
+# Heatmaps
+
+Row order is a choice, so it is a parameter of this file rather than a second copy of it.
+
+| `sort_participants` | Order |
+|---|---|
+| `"sound"` (default) | drawings affected under **sound alone**, then **how many of the 11 oral + sound stimuli were a yes**, both descending |
+| `"burden"` | total affected drawings across all 23 stimuli |
+| `"id"` | original participant ID |
+
+The secondary key counts *stimuli*, not drawings — "more oral yes than no" is a question about
+how many of the eleven responded, and a participant with one stimulus affecting many drawings
+is a different case from one with many stimuli affecting one drawing each. The two rank
+participants differently (they correlate 0.81). Only 7 distinct sound values occur among the
+23 responders, so the secondary key breaks 16 of those 23 rows and is doing real work.
+
+The default groups the sound-responders into a block at the top — the subgroup the
+elimination endpoint is about — so the elimination pattern can be read by scanning right from
+the sound column into "Oral + sound" and seeing where cells turn grey. IDs stay on the axis
+under every option, so nothing is hidden, and the caption records which order was used.
+
+```{r order}
+blocks <- by_stim |>
+  mutate(block = case_when(e == 1 ~ "sound", e %in% 2:12 ~ "oral_snd", TRUE ~ "oral")) |>
+  group_by(pid, block) |>
+  summarise(draws = sum(n_vs),     # drawings affected in this block
+            yes   = sum(any_vs),   # stimuli in this block that produced any VS
+            .groups = "drop") |>
+  pivot_wider(names_from = block, values_from = c(draws, yes)) |>
+  mutate(total = draws_sound + draws_oral_snd + draws_oral)
+
+ord <- switch(params$sort_participants,
+  sound  = arrange(blocks, desc(draws_sound), desc(yes_oral_snd)),
+  burden = arrange(blocks, desc(total)),
+  id     = arrange(blocks, pid),
+  stop("sort_participants must be 'sound', 'burden' or 'id'")
+)
+
+by_stim <- by_stim |>
+  mutate(pid_f   = factor(pid, levels = rev(ord$pid)),
+         label_f = factor(label, levels = c("Sound", oral)))
+
+sort_note <- switch(params$sort_participants,
+  sound  = "Participants ordered by drawings affected under sound alone, then by how many of the 11 oral + sound stimuli produced a pseudo-scotoma.",
+  burden = "Participants ordered by total affected drawings, most affected at top.",
+  id     = "Participants in original ID order."
+)
+
+cat("sound-responders in the top block:", sum(blocks$draws_sound > 0), "of", nrow(blocks), "\n")
+cat("oral + sound 'yes' count, range:", range(blocks$yes_oral_snd), "of 11\n")
+```
+
+```{r theme}
+theme_heat <- theme_minimal(base_size = 10) +
+  theme(
+    panel.grid      = element_blank(),
+    panel.spacing.x = unit(16, "pt"),
+    # The "Sound alone" panel is one column wide, so its centred strip label
+    # is wider than the panel and gets clipped to "und alo". Let it overflow
+    # into the panel gap instead.
+    strip.clip      = "off",
+    axis.text.x     = element_text(angle = 90, vjust = 0.5, hjust = 1, colour = ink_muted),
+    axis.text.y     = element_text(size = 6.5, colour = ink_muted),
+    axis.title      = element_text(colour = ink_muted, size = 9),
+    strip.text      = element_text(colour = ink_primary, face = "bold", size = 9),
+    plot.title      = element_text(colour = ink_primary, face = "bold", size = 12),
+    plot.subtitle   = element_text(colour = ink_muted, size = 9),
+    plot.caption    = element_text(colour = ink_muted, size = 7.5, hjust = 0),
+    plot.background = element_rect(fill = surface, colour = NA),
+    legend.title    = element_text(colour = ink_muted, size = 8.5),
+    legend.text     = element_text(colour = ink_muted, size = 8)
+  )
+
+# Tile borders drawn in the surface colour ARE the 2px gap between marks,
+# not a border around them.
+gap <- 0.35
+```
+
+```{r figure-dir}
+fig <- file.path("..", "outputs", "figures")
+dir.create(fig, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Binary — all three phases
+
+Rebuilt 2026-08-18 for the client summary, which needs one figure showing where a
+pseudo-scotoma was reported across **all** three measured phases. It carries no
+classification: every cell is the same yes/no question, so sound alone, sound + oral and oral
+alone are read on one scale.
+
+This is a different figure from the two in `collapse_conditions_and_classify.Rmd` and writes a
+different filename, so neither overwrites the other:
+
+- `heatmap_elimination.png` — the 23 sound-responders only, sound + oral cells scored as
+  eliminated or not. That is the endpoint figure.
+- `heatmap_oral_alone_vs.png` — the oral-alone phase on its own.
+- **this figure** — all 38 participants, all 23 conditions, presence only.
+
+⚠️ **Prevalence is read down a column, never across a row.** The middle panel holds eleven
+conditions and the right panel eleven more, against the left panel's one, so counting how much
+blue a panel contains compares opportunity counts rather than stimuli.
+
+```{r heatmap-binary, fig.width=10, fig.height=8, dpi=300}
+# Manuscript wording for the panel headings. The internal `phase` levels are left alone -- the
+# prevalence barchart below filters on them by name.
+heat_bin <- by_stim |>
+  mutate(
+    state   = if_else(any_vs == 1, "Pseudo-scotoma", "None"),
+    phase_f = factor(c("Sound alone" = "Sound alone", "Oral + sound" = "Sound + OPS",
+                       "Oral alone" = "OPS only")[as.character(phase)],
+                     levels = c("Sound alone", "Sound + OPS", "OPS only"))
+  )
+stopifnot(!any(is.na(heat_bin$phase_f)))
+
+phase_n <- heat_bin |>
+  group_by(phase_f) |>
+  summarise(k = n_distinct(pid[any_vs == 1]), .groups = "drop")
+stopifnot(phase_n$k == c(23, 34, 31))
+
+p_bin <- ggplot(heat_bin, aes(label_f, pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  facet_grid(. ~ phase_f, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("Pseudo-scotoma" = col_present, "None" = col_absent),
+                    breaks = "Pseudo-scotoma") +
+  labs(
+    title    = "Visual pseudo-scotomas by participant and stimulus condition",
+    subtitle = paste0("One cell per participant per condition, collapsed across the 12 ",
+                      "drawings (n = 38). Sound alone 23/38;\nat least one sound + OPS ",
+                      "condition 34/38; at least one OPS condition without sound 31/38."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "OPS = oral proprioceptive stimuli. M1-M3 are combined oral stimuli; the remaining ",
+      "eight are dental stimuli, labelled by tooth (FDI notation)\n",
+      "and site (V = buccal, P = palatal, L = lingual). ",
+      "Prevalence is read down a column: each column is one condition with one opportunity\n",
+      "for a pseudo-scotoma to be recorded, so the columns are directly comparable, whereas ",
+      "the sound + OPS and OPS only panels contain eleven\n",
+      "conditions each against the single sound condition. The OPS only phase was always ",
+      "performed last, so differences between phases are\n",
+      "confounded with time, fatigue and practice. Descriptive; no intervals and no test."
+    )
+  ) +
+  theme_heat +
+  theme(legend.title = element_blank())
+p_bin
+
+ggsave(file.path(fig, "heatmap_vs_binary_three_phases.png"), p_bin,
+       width = 10, height = 8, dpi = 300, bg = surface)
+```
+
+## Count — how many of the 12 drawings
+
+```{r heatmap-count, fig.width=9, fig.height=8, dpi=300}
+p_cnt <- ggplot(by_stim, aes(label_f, pid_f,
+                             fill = ifelse(n_vs == 0, NA_real_, n_vs))) +
+  geom_tile(colour = surface, linewidth = gap) +
+  facet_grid(. ~ phase, scales = "free_x", space = "free_x") +
+  scale_fill_gradientn(
+    colours  = ramp_blue,
+    limits   = c(1, 12),
+    breaks   = c(1, 3, 6, 9, 12),
+    na.value = col_absent,
+    name     = "Drawings\naffected",
+    guide    = guide_colourbar(barwidth = 0.6, barheight = 7, ticks = FALSE)
+  ) +
+  labs(
+    title    = "Number of drawings affected, by participant and stimulus",
+    subtitle = "0 to 12. Grey = no pseudo-scotoma under that stimulus",
+    x = NULL, y = "Participant",
+    caption  = paste0(sort_note, "\n",
+                      "n = 38. Values in data/processed/vs_count_participant_by_stimulus.csv")
+  ) +
+  theme_heat
+p_cnt
+
+ggsave(file.path(fig, "heatmap_vs_count.png"), p_cnt,
+       width = 9, height = 8, dpi = 300, bg = surface)
+```
+
+# Prevalence by condition
+
+`vs_prevalence_barchart.png` existed in `outputs/figures/` with **no script anywhere in the
+repository that produced it** — found orphaned on 2026-08-17. It is rebuilt here so it has a
+source of truth, and rebuilt to Esther's specification: **the sound-only condition and the
+oral-only conditions, with the sound + oral conditions excluded.**
+
+⚠️ **One bar per condition, not one bar per phase.** The eleven oral-alone stimuli are shown
+individually rather than collapsed into a single "any oral stimulus" bar. A collapsed bar would
+have eleven chances to be positive against the sound bar's one, so it would measure the number
+of opportunities rather than the effect of the stimulus — which is exactly why
+`ANALYSIS_PLAN.md` §5 declines Cochran's Q across phases. Every bar here is one condition,
+twelve drawings, one opportunity, so the bars are like-for-like.
+
+No confidence intervals: these are descriptive. Wilson intervals for every proportion that
+enters a comparison are analysis 2 of the plan, and the plan is not yet agreed.
+
+```{r prevalence-barchart, fig.width=9, fig.height=5.5, dpi=300}
+prev_dat <- by_stim |>
+  filter(phase != "Oral + sound") |>
+  group_by(label, phase) |>
+  summarise(n_vs = sum(any_vs), .groups = "drop") |>
+  mutate(
+    pct    = 100 * n_vs / n_distinct(by_stim$pid),
+    group  = factor(if_else(phase == "Sound alone", "Sound alone",
+                            "Oral stimulus alone, no sound"),
+                    levels = c("Sound alone", "Oral stimulus alone, no sound")),
+    lab_f  = factor(label, levels = c("Sound", oral))
+  )
+
+n_p <- n_distinct(by_stim$pid)
+
+p_prev <- ggplot(prev_dat, aes(lab_f, pct)) +
+  # One measure, one hue. The two condition types are separated by panel rather than by
+  # colour, so no colour is spent re-encoding what the panel heading already says.
+  geom_col(fill = col_present, width = 0.68) +
+  geom_text(aes(label = paste0(n_vs, "\n", round(pct), "%")),
+            vjust = -0.25, size = 2.7, colour = ink_muted, lineheight = 0.95) +
+  facet_grid(. ~ group, scales = "free_x", space = "free_x") +
+  # Zero baseline, as a bar chart requires. The ceiling is 70 rather than 100 only because
+  # nothing reaches 62% and the empty upper third made the bars harder to compare; no bar is
+  # clipped and no difference is exaggerated.
+  scale_y_continuous(limits = c(0, 70), breaks = seq(0, 70, 10),
+                     expand = expansion(mult = c(0, 0.10))) +
+  labs(
+    title    = "Pseudo-scotoma prevalence, by condition",
+    subtitle = paste0("Percentage of participants reporting a visual pseudo-scotoma in at ",
+                      "least one of the 12 drawings. n = ", n_p, ".\nSound + oral conditions ",
+                      "are excluded by design; see the caption."),
+    x = NULL, y = "Participants with a pseudo-scotoma (%)",
+    caption = paste0(
+      "Counts above each bar are the number of participants, out of ", n_p, ".\n",
+      "Each bar is a single condition with a single opportunity to be positive, so the bars ",
+      "are directly comparable to each other. The eleven oral\n",
+      "stimuli are NOT collapsed into one bar: a union over eleven conditions would have ",
+      "eleven chances against the sound bar's one.\n",
+      "Descriptive; no intervals and no test. The oral-alone phase always ran last, so ",
+      "condition is confounded with time (ANALYSIS_PLAN.md 2a.1).\n",
+      "Values in data/processed/vs_binary_participant_by_stimulus.csv"
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_line(colour = "#e8e6e2", linewidth = 0.3),
+    panel.spacing.x    = unit(16, "pt"),
+    strip.clip         = "off",
+    strip.text         = element_text(colour = ink_primary, face = "bold", size = 9),
+    axis.text.x        = element_text(angle = 90, vjust = 0.5, hjust = 1, colour = ink_muted),
+    axis.text.y        = element_text(colour = ink_muted),
+    axis.title         = element_text(colour = ink_muted, size = 9),
+    plot.title         = element_text(colour = ink_primary, face = "bold", size = 12),
+    plot.subtitle      = element_text(colour = ink_muted, size = 8.5),
+    plot.caption       = element_text(colour = ink_muted, size = 7, hjust = 0),
+    plot.background    = element_rect(fill = surface, colour = NA)
+  )
+p_prev
+
+ggsave(file.path(fig, "vs_prevalence_barchart.png"), p_prev,
+       width = 9, height = 5.5, dpi = 300, bg = surface)
+```
+
+```{r session}
+sessionInfo()
+```

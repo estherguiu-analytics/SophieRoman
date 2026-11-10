@@ -1,0 +1,714 @@
+---
+title: "Study 1 - the statistics Reviewer 1 asked for, on the collapsed (clinical) framing"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr); library(tidyr); library(stringr)
+source("interval_helpers.R")
+```
+
+# Purpose
+
+Answers Reviewer 1's two statistical points **at the level the manuscript reports them** —
+that is, collapsed across stimuli, which is how the paper is written and how the intervention
+would be used clinically:
+
+> "The claim that OPS eliminates sound-induced VS rests on comparing proportions across
+> conditions (e.g., 60.5% vs. 81.6%; 18/23 elimination), yet no test (e.g., McNemar's test for
+> paired proportions, chi-square tests, or Cochran's Q across the four phases) is performed to
+> establish that these differences are not attributable to chance."
+
+> "The comparison of DS vs. COS efficacy, and the analysis of concordance between anatomically
+> equivalent stimulations (complete/partial/no concordance in 5/3/3 cases), are presented as
+> raw counts with no measure of agreement (e.g., Cohen's kappa) or confidence intervals."
+
+**Framing decision (Esther, 2026-08-17).** The collapsed proportions are computed and tested
+as the clinical estimand: the question is whether *some* oral stimulus can be found for a
+patient, and how many were tried is part of the protocol rather than a nuisance. That is a
+coherent estimand and it is what the paper claims. `prevalence_ci_and_paired_contrasts.Rmd`
+holds the per-stimulus analysis, which answers the different question of whether a *given*
+stimulus works.
+
+Retrospective and exploratory throughout. Nothing here was pre-specified.
+
+```{r load}
+proc <- file.path("..", "..", "data", "processed")
+f <- file.path(proc, "participant_condition_long.csv")
+if (!file.exists(f)) stop("Run collapse_conditions_and_classify.Rmd first.")
+
+long <- read.csv(f, stringsAsFactors = FALSE)
+n_p <- n_distinct(long$pid)
+stopifnot(nrow(long) == n_p * 23)
+
+chk <- round(100 * wilson(23, 38), 1)
+stopifnot(abs(chk[["lower"]] - 44.7) < 0.15, abs(chk[["upper"]] - 74.4) < 0.15)
+cat("n =", n_p, "| Wilson verified against the plan's worked example\n")
+```
+
+# ⚠️ 1. The warning that has to travel with every number below
+
+**The collapsed comparison gives the oral conditions more chances to be positive than the
+sound condition, and the study did not repeat the sound condition to match.**
+
+Concretely: "VS with OPS" is positive if *any* of 11 oral stimuli produced a VS in any of 12
+drawings — up to 132 binary opportunities. "VS with sound" rests on **one** presentation of the
+sound and 12 drawings. So part of the gap between 60.5% and 81.6% is the difference in how many
+times each condition was sampled, not a difference between sound and oral stimulation.
+
+The same asymmetry inflates the elimination endpoint: to be counted as eliminating, a
+participant needed *one* of 11 stimuli to clear all 12 drawings, and the study never re-measured
+sound-only to estimate how often the line comes back on its own.
+
+**This cannot be corrected from the data on hand** — correcting it needs repeated sound-only
+measurements, which is `ANALYSIS_PLAN.md` §2a.4 and open item 3 in `../../CLAUDE.md` (Clàudia's
+thesis). It is recorded here so the limitation is on the record, identified by Esther on
+2026-08-17, before any of these tests were read.
+
+⚠️ **The reviewer did not raise this.** Whether to volunteer it in the response letter is
+Esther's call — answering only what is asked is defensible. What is **not** defensible is
+printing these comparisons in the paper without the limitation stated somewhere in it. It is
+therefore tracked in `Manuscript/MANUSCRIPT.md` §4 as a limitation for the Limitations section,
+not as a point in the reply.
+
+```{r per-pid}
+per_pid <- long |>
+  group_by(pid) |>
+  summarise(
+    sound    = any_vs[block_type == "sound_only"],
+    ops_snd  = as.integer(any(any_vs[block_type == "oral_plus_sound"] == 1)),
+    # "OPS" in the paper means the oral-alone phase, E13-E23. Verified below: that reading
+    # reproduces all five published cells (31 / 3 / 11 / 20 / 4); reading OPS as any oral
+    # condition, or as oral + sound, reproduces none of them.
+    ops      = as.integer(any(any_vs[block_type == "oral_alone"] == 1)),
+    ops_alone= as.integer(any(any_vs[block_type == "oral_alone"] == 1)),
+    elim_ds  = as.integer(any(classification[block_type == "oral_plus_sound" & type == "DS"]  == "regulador")),
+    elim_cos = as.integer(any(classification[block_type == "oral_plus_sound" & type == "COS"] == "regulador")),
+    .groups = "drop"
+  ) |>
+  mutate(elim_any = as.integer(elim_ds == 1 | elim_cos == 1))
+
+# Reproduce the published counts before testing anything against them.
+stopifnot(sum(per_pid$sound) == 23, sum(per_pid$ops) == 31)
+stopifnot(sum(per_pid$sound == 0 & per_pid$ops == 0) == 4)
+stopifnot(sum(per_pid$sound == 1 & per_pid$ops == 1) == 20)
+stopifnot(sum(per_pid$sound == 1 & per_pid$ops == 0) == 3)
+stopifnot(sum(per_pid$sound == 0 & per_pid$ops == 1) == 11)
+stopifnot(sum(per_pid$elim_any) == 18)
+cat("all published prevalence and elimination counts reproduce\n")
+```
+
+# 2. Every percentage in the paper, with its 95% Wilson interval
+
+Transcribed from `Manuscript/drafts/…-EGH.docx`, Results §1–2 and the abstract. This is the
+table the revision needs.
+
+⚠️ Two things the paper's own arithmetic gets wrong, found while building this:
+
+1. The text says *"Of these 34: 3 (7.9%), 11 (29.0%), 20 (52.6%)"* — but those three
+   percentages are **of 38, not of 34**. Out of 34 they would be 8.8%, 32.4% and 58.8%. Either
+   the denominator sentence or the percentages must change.
+2. The elimination endpoint is printed as **47.3% (18/38)** in the abstract and Results. That
+   is arithmetically right but it is the wrong denominator for the claim: the population at
+   risk of *eliminating* a sound-induced VS is the 23 who had one, giving **78.3%**. Both are
+   in the table; the paper should lead with 78.3% of 23 and may quote 47.3% of 38 as a
+   secondary framing.
+
+```{r percentages}
+row_ci <- function(label, x, n, note = "") {
+  ci <- wilson(x, n)
+  tibble(quantity = label, x = x, n = n,
+         pct = round(100 * x / n, 1),
+         lower = round(100 * ci[["lower"]], 1),
+         upper = round(100 * ci[["upper"]], 1),
+         note = note)
+}
+
+paper_tbl <- bind_rows(
+  row_ci("No VS under any condition",                sum(per_pid$sound == 0 & per_pid$ops == 0), 38),
+  row_ci("VS under at least one condition",          sum(per_pid$sound == 1 | per_pid$ops == 1), 38),
+  row_ci("VS with sound only",                       sum(per_pid$sound == 1 & per_pid$ops == 0), 38,
+         "paper prints 7.9%, i.e. of 38, while the sentence says 'of these 34'"),
+  row_ci("VS with OPS only",                         sum(per_pid$sound == 0 & per_pid$ops == 1), 38,
+         "paper prints 29.0%, of 38, same issue"),
+  row_ci("VS with both sound and OPS",               sum(per_pid$sound == 1 & per_pid$ops == 1), 38,
+         "paper prints 52.6%, of 38, same issue"),
+  row_ci("VS during sound stimulation",              sum(per_pid$sound), 38),
+  row_ci("VS during OPS",                            sum(per_pid$ops), 38,
+         "union over the 11 oral-alone conditions, phase 4 - see section 1"),
+  row_ci("Elimination of sound-induced VS, of the 23 at risk", sum(per_pid$elim_any), 23,
+         "the correct denominator for the claim"),
+  row_ci("Elimination of sound-induced VS, of all 38",         sum(per_pid$elim_any), 38,
+         "the paper's 47.3% - arithmetically right, wrong denominator for the claim"),
+  row_ci("Of the 23: eliminated by DS (alone or with COS)",    sum(per_pid$elim_ds), 23),
+  row_ci("Of the 23: eliminated by COS (alone or with DS)",    sum(per_pid$elim_cos), 23),
+  row_ci("Of the 23: eliminated by DS only",  sum(per_pid$elim_ds == 1 & per_pid$elim_cos == 0), 23),
+  row_ci("Of the 23: eliminated by COS only", sum(per_pid$elim_ds == 0 & per_pid$elim_cos == 1), 23),
+  row_ci("Of the 23: eliminated by both",     sum(per_pid$elim_ds == 1 & per_pid$elim_cos == 1), 23),
+  # must be restricted to the 23: elim_any == 0 is also true for all 15 who had no
+  # sound-induced VS to eliminate, and counting those against a denominator of 23 gives 20/23.
+  row_ci("Of the 23: no elimination",
+         sum(per_pid$sound == 1 & per_pid$elim_any == 0), 23)
+)
+
+# The four elimination outcomes must partition the 23 exactly.
+stopifnot(sum(per_pid$elim_ds == 1 & per_pid$elim_cos == 0) +
+          sum(per_pid$elim_ds == 0 & per_pid$elim_cos == 1) +
+          sum(per_pid$elim_ds == 1 & per_pid$elim_cos == 1) +
+          sum(per_pid$sound == 1 & per_pid$elim_any == 0) == 23)
+
+knitr::kable(paper_tbl, caption = "Every proportion the manuscript reports, with 95% Wilson intervals")
+```
+
+# 3. Sound vs OPS — the 60.5% vs 81.6% the reviewer names
+
+These are **paired** proportions: the same 38 people contributed both. A chi-square test would
+be wrong here, because it assumes two independent samples and would use the wrong standard
+error. Exact McNemar is the correct test and is what the reviewer's own first suggestion names.
+
+⚠️ **Note which phases this compares.** Reproducing the published cells establishes that the
+paper's "OPS" in the prevalence section means the **oral-alone phase (phase 4)**, not oral +
+sound. So 60.5% vs 81.6% is *sound alone* against *oral stimuli with the sound off* — two
+isolated conditions from two different phases. The elimination endpoint, by contrast, uses
+**phase 3** (oral + sound). The paper calls both "OPS", which is a clarity problem the revision
+should fix regardless of what any test returns.
+
+```{r sound-vs-ops}
+tab <- with(per_pid, c(
+  a = sum(sound == 1 & ops == 1), b = sum(sound == 1 & ops == 0),
+  c = sum(sound == 0 & ops == 1), d = sum(sound == 0 & ops == 0)))
+print(tab)
+
+mc <- mcnemar_exact(tab[["b"]], tab[["c"]])
+nc <- newcombe_paired(tab[["a"]], tab[["b"]], tab[["c"]], tab[["d"]])
+
+cat(sprintf("\nVS with sound   : %d/38 = %.1f%%\n", tab[["a"]] + tab[["b"]],
+            100 * (tab[["a"]] + tab[["b"]]) / 38))
+cat(sprintf("VS with OPS     : %d/38 = %.1f%%\n", tab[["a"]] + tab[["c"]],
+            100 * (tab[["a"]] + tab[["c"]]) / 38))
+cat(sprintf("Risk difference : %+.1f pp [%+.1f, %+.1f]  (negative = OPS higher)\n",
+            100 * nc[["rd"]], 100 * nc[["lower"]], 100 * nc[["upper"]]))
+cat(sprintf("Exact McNemar   : p = %.4f  on %d discordant pairs (b=%d, c=%d)\n",
+            mc[["p"]], mc[["discordant"]], tab[["b"]], tab[["c"]]))
+```
+
+**Reading.** The difference is in the direction of *more* VS under OPS, not less, and it is
+statistically clear. But it is the least interesting significant result in the study: §1 says
+the OPS arm had up to 132 opportunities against the sound arm's 12, so this test largely
+confirms that more sampling finds more events. **It should not be reported as evidence that
+oral stimulation induces more pseudo-scotomas than sound.** The honest use of this number is
+descriptive — 81.6% of participants showed a VS somewhere in the oral protocol.
+
+# 4. Cochran's Q across phases
+
+The reviewer asks for Q across four phases. Two obstacles, both worth stating in the reply:
+
+1. **Phase 1 is not in the data file.** The 0/38 is an assertion (Esther, 2026-08-17), not a
+   recorded column. Entering it as a constant column of zeros would make Q partly a test
+   against a number that cannot be checked, and a constant column inflates Q mechanically.
+2. **The phases are not comparable in opportunity** — phase 2 is one condition, phases 3 and 4
+   are unions of eleven each (§1). Q would then be measuring the number of chances each phase
+   had, not the effect of its stimulus.
+
+Q is therefore reported across the **three measurable phases**, with the caveat attached, and
+`ANALYSIS_PLAN.md` §5 keeps the per-stimulus model as the analysis that answers the question
+properly.
+
+```{r cochran}
+X <- as.matrix(per_pid[, c("sound", "ops_snd", "ops_alone")])
+colnames(X) <- c("Sound alone", "Oral + sound (any)", "Oral alone (any)")
+print(colSums(X))
+
+q3 <- cochran_q(X)
+cat(sprintf("\nCochran's Q = %.3f, df = %d, p = %.4f  (%d informative participants)\n",
+            q3[["Q"]], q3[["df"]], q3[["p"]], q3[["informative_rows"]]))
+
+# What adding the asserted all-zero baseline would do, for the record only.
+q4 <- cochran_q(cbind(baseline = 0L, X))
+cat(sprintf("With the asserted 0/38 baseline as a 4th column: Q = %.3f, df = %d, p = %.5f\n",
+            q4[["Q"]], q4[["df"]], q4[["p"]]))
+cat("\nThe 4-phase Q is larger purely because a column that is 0 for everyone cannot agree\n",
+    "with columns where most people are positive. It is not evidence about the stimuli.\n")
+```
+
+# 5. DS vs COS efficacy
+
+Among the 23 participants with a sound-induced VS, did dental stimuli and combined oral stimuli
+differ in how often they eliminated it? Paired again — the same 23 people were exposed to both.
+
+```{r ds-vs-cos}
+sub <- filter(per_pid, sound == 1)
+stopifnot(nrow(sub) == 23)
+
+t2 <- with(sub, c(a = sum(elim_ds == 1 & elim_cos == 1), b = sum(elim_ds == 1 & elim_cos == 0),
+                  c = sum(elim_ds == 0 & elim_cos == 1), d = sum(elim_ds == 0 & elim_cos == 0)))
+print(t2)
+# must match the published 11 both / 5 DS only / 2 COS only
+stopifnot(t2[["a"]] == 11, t2[["b"]] == 5, t2[["c"]] == 2)
+
+mc2 <- mcnemar_exact(t2[["b"]], t2[["c"]])
+nc2 <- newcombe_paired(t2[["a"]], t2[["b"]], t2[["c"]], t2[["d"]])
+w_ds  <- wilson(t2[["a"]] + t2[["b"]], 23)
+w_cos <- wilson(t2[["a"]] + t2[["c"]], 23)
+
+cat(sprintf("\nEliminated by DS  : %d/23 = %.1f%% [%.1f, %.1f]\n", t2[["a"]] + t2[["b"]],
+            100 * (t2[["a"]] + t2[["b"]]) / 23, 100 * w_ds[["lower"]], 100 * w_ds[["upper"]]))
+cat(sprintf("Eliminated by COS : %d/23 = %.1f%% [%.1f, %.1f]\n", t2[["a"]] + t2[["c"]],
+            100 * (t2[["a"]] + t2[["c"]]) / 23, 100 * w_cos[["lower"]], 100 * w_cos[["upper"]]))
+cat(sprintf("Risk difference   : %+.1f pp [%+.1f, %+.1f]  (positive = DS more often)\n",
+            100 * nc2[["rd"]], 100 * nc2[["lower"]], 100 * nc2[["upper"]]))
+cat(sprintf("Exact McNemar     : p = %.4f  on only %d discordant pairs\n",
+            mc2[["p"]], mc2[["discordant"]]))
+```
+
+⚠️ **Seven discordant pairs.** Whatever this test returns, it cannot distinguish anything but a
+very large difference. The interval is the honest answer, and it is wide. Note also that DS had
+**8 stimuli and COS only 3**, so DS again had more chances — the same §1 problem inside this
+comparison. That is a further reason the point estimate favouring DS should not be read as DS
+being the better stimulus type.
+
+# 6. Agreement between DS and COS — the reviewer's kappa
+
+Two different agreement questions. Both are reported because the reviewer's wording spans them.
+
+## 6a. Do DS and COS agree about *whose* sound-induced VS they eliminated? (n = 23)
+
+The 2x2 below is the published 11 both / 5 DS-only / 2 COS-only, plus the 5 who eliminated with
+neither. Agreement = both eliminated, or neither did. The denominator is the 23 who had a
+sound-induced VS, not the 18 who eliminated: elimination is only a question for someone who had
+one, and restricting to the 18 would empty cell `d` so kappa could not be computed.
+
+⚠️ Do **not** describe this as "responding to both stimulus types" — it is specifically about
+elimination of a sound-induced VS, and the vaguer phrasing reads as something else.
+
+```{r kappa-elim}
+k1 <- kappa_2x2(t2[["a"]], t2[["b"]], t2[["c"]], t2[["d"]])
+print(round(k1, 3))
+cat(sprintf("\nraw agreement %.1f%% [%.1f, %.1f] | kappa %.2f [%.2f, %.2f] | PABAK %.2f\n",
+            100 * k1[["po"]], 100 * k1[["po_lower"]], 100 * k1[["po_upper"]],
+            k1[["kappa"]], k1[["kappa_lower"]], k1[["kappa_upper"]], k1[["pabak"]]))
+```
+
+**This is the prevalence/bias paradox the plan predicted, now with numbers.** Raw agreement is
+high while kappa is modest, because elimination is common in this subgroup — the prevalence
+index is large, so chance agreement is high and kappa is pulled down. Reporting kappa alone
+would understate the agreement; reporting raw agreement alone would overstate it. Report both,
+plus PABAK, and say why they differ. The kappa interval is a large-sample approximation at
+n = 23 and should be described as indicative only.
+
+## 6b. Concordance between anatomically equivalent stimulations (n = 11)
+
+✅ **RESOLVED 2026-08-17. The published 5 complete / 3 partial / 3 none now reproduces exactly.**
+
+The definition was read off the draft by Esther (Results ¶178 plus the Fig. 2 equivalences) and is:
+
+- Each of the **three** COS slots (M1, M2, M3) is judged for every participant — including slots
+  where that COS did **not** eliminate.
+- A slot **matches** if the COS eliminated **and at least one** of its anatomically equivalent DS
+  eliminated. "At least one", not all — that was the piece I had wrong.
+- **complete** = all 3 slots match · **partial** = 1 or 2 match · **none** = 0 match.
+
+Equivalences, Fig. 2: M1 ↔ 11P, 21P · M2 ↔ 11V, 21V, 31V, 41V · M3 ↔ 31L, 41L.
+
+⚠️ **This is positive co-occurrence, not two-way agreement.** A slot where neither the COS nor its
+equivalents eliminated counts as a **non-match** here, whereas an agreement statistic such as
+kappa would count it as agreement. That is why the classification below and the kappa further down
+are different quantities and must not be presented as the same thing measured twice.
+
+❓ **UNCONFIRMED, and it is the one judgement call left in this analysis.** Treating "neither
+eliminated" as a non-match is what reproduces 5/3/3, so it is almost certainly what the authors
+did — but it has not been confirmed by them. The alternative convention (count it as concordant,
+i.e. reading E below) gives **5/5/1**, moving two participants from `none` to `partial`. Asked of
+Sophie in `Manuscript/revisions/analysis_summary.md` §3e and §6. If she confirms the *other*
+convention, `published` must be replaced by `reading_E` and the assertion below updated.
+
+The three earlier readings that failed are kept in the code so the search is on the record.
+
+```{r concordance}
+elim <- long |>
+  filter(block_type == "oral_plus_sound") |>
+  transmute(pid, oral, elim = as.integer(classification == "regulador"))
+
+equiv <- list(M1 = c("11P", "21P"),
+              M2 = c("11V", "21V", "31V", "41V"),
+              M3 = c("31L", "41L"))
+
+got <- function(p, s) any(elim$elim[elim$pid == p & elim$oral %in% s] == 1)
+
+both_types <- filter(per_pid, elim_ds == 1, elim_cos == 1)$pid
+stopifnot(length(both_types) == 11)
+
+n_eq_elim <- function(p, m) sum(elim$elim[elim$pid == p & elim$oral %in% equiv[[m]]] == 1)
+
+conc <- lapply(both_types, function(p) {
+  cos_used <- vapply(names(equiv), function(m) got(p, m), logical(1))
+  any_ds   <- vapply(names(equiv), function(m) n_eq_elim(p, m) >= 1, logical(1))
+  all_ds   <- vapply(names(equiv), function(m) n_eq_elim(p, m) == length(equiv[[m]]),
+                     logical(1))
+  used <- which(cos_used)
+  tibble(
+    pid = p, n_cos = sum(cos_used),
+    n_matched = sum(any_ds[used]),
+    # A: only the COS the participant actually eliminated with are judged; a COS counts as
+    #    matched if ANY of its anatomical equivalents eliminated.
+    reading_A = if (length(used) == 0) "none"
+                else if (all(any_ds[used])) "complete"
+                else if (any(any_ds[used])) "partial" else "none",
+    # C: as A, but "complete" demands that ALL equivalents of each used COS eliminated.
+    reading_C = if (length(used) == 0) "none"
+                else if (all(all_ds[used])) "complete"
+                else if (any(any_ds[used])) "partial" else "none",
+    # E: all THREE COS slots are judged, in both directions - the COS and its equivalent DS
+    #    must agree on eliminating or on not eliminating. This is the reading that treats
+    #    "concordance" as agreement rather than as co-occurrence.
+    agree3 = sum(cos_used == any_ds),
+    reading_E = if (sum(cos_used == any_ds) == 3) "complete"
+                else if (sum(cos_used == any_ds) == 0) "none" else "partial",
+    # ===== THE PUBLISHED DEFINITION =====
+    # All three COS slots judged; a slot matches iff the COS eliminated AND >= 1 of its
+    # anatomical equivalents eliminated. complete = 3 matches, partial = 1-2, none = 0.
+    n_match   = sum(cos_used & any_ds),
+    published = if (sum(cos_used & any_ds) == 3) "complete"
+                else if (sum(cos_used & any_ds) == 0) "none" else "partial"
+  )
+}) |> bind_rows()
+
+knitr::kable(conc, caption = "Per participant: n_match / published is the reproduced rule; readings A, C and E are the earlier attempts that failed")
+
+for (r in c("published", "reading_A", "reading_C", "reading_E")) {
+  cat("\n", r, ":\n", sep = ""); print(table(factor(conc[[r]],
+      levels = c("complete", "partial", "none"))))
+}
+cat("\nPaper reports: complete 5 / partial 3 / none 3\n")
+
+# The reproduced rule must keep reproducing, or something upstream has changed.
+pub <- table(factor(conc$published, levels = c("complete", "partial", "none")))
+stopifnot(pub[["complete"]] == 5, pub[["partial"]] == 3, pub[["none"]] == 3)
+cat("\n*** 5 / 3 / 3 REPRODUCED - asserted, so this knit fails if it ever stops holding ***\n")
+
+cat("\nParticipant-level proportions with 95% Wilson intervals (n = 11):\n")
+for (cl in c("complete", "partial", "none")) {
+  x <- sum(conc$published == cl); ci <- wilson(x, nrow(conc))
+  cat(sprintf("  %-9s %2d/%d = %4.1f%%  [%4.1f, %4.1f]\n", cl, x, nrow(conc),
+              100 * x / nrow(conc), 100 * ci[["lower"]], 100 * ci[["upper"]]))
+}
+
+count_reading <- function(r) {
+  tt <- table(factor(conc[[r]], levels = c("complete", "partial", "none")))
+  tibble(source = paste("rebuild,", r), complete = tt[["complete"]],
+         partial = tt[["partial"]], none = tt[["none"]])
+}
+
+summary_tbl <- bind_rows(
+  tibble(source = "manuscript draft, Results para 178", complete = 5, partial = 3, none = 3),
+  tibble(source = "Spanish recount",                    complete = 5, partial = 3, none = 3),
+  tibble(source = "reviewer's letter",                  complete = 5, partial = 3, none = 3),
+  count_reading("published"),
+  count_reading("reading_A"), count_reading("reading_C"), count_reading("reading_E")
+)
+knitr::kable(summary_tbl, caption = "Concordance: what each source says")
+```
+
+### Worked examples, one per class
+
+```{r concordance-examples}
+show_pid <- function(p) {
+  w <- filter(conc, pid == p)
+  cat(sprintf("\nparticipant %s - %s (%d of 3 slots match)\n", p, w$published, w$n_match))
+  for (m in names(equiv)) {
+    cat(sprintf("  %-3s eliminated: %-3s | equivalents %-22s %d of %d eliminated | match: %s\n",
+        m, if (got(p, m)) "YES" else "no", paste(equiv[[m]], collapse = ","),
+        n_eq_elim(p, m), length(equiv[[m]]),
+        if (got(p, m) && n_eq_elim(p, m) >= 1) "YES" else "NO"))
+  }
+}
+for (cl in c("complete", "partial", "none")) show_pid(conc$pid[conc$published == cl][1])
+```
+
+```{r concordance-kappa}
+# Agreement per COS-DS anatomical pair, pooled over the 11 participants. This is the
+# defensible kappa for "do anatomically equivalent stimulations agree": one row per
+# participant x COS type, agreement between the COS result and its equivalent DS result.
+pair_dat <- expand_grid(pid = both_types, cos = names(equiv)) |>
+  rowwise() |>
+  mutate(cos_elim = as.integer(got(pid, cos)),
+         ds_elim  = as.integer(got(pid, equiv[[cos]]))) |>
+  ungroup()
+
+t3 <- c(a = sum(pair_dat$cos_elim == 1 & pair_dat$ds_elim == 1),
+        b = sum(pair_dat$cos_elim == 1 & pair_dat$ds_elim == 0),
+        c = sum(pair_dat$cos_elim == 0 & pair_dat$ds_elim == 1),
+        d = sum(pair_dat$cos_elim == 0 & pair_dat$ds_elim == 0))
+print(t3)
+
+# Two DIFFERENT quantities from the same table, and the distinction matters:
+#   positive concordance = of the slots where the COS eliminated, how many had an equivalent
+#                          DS eliminate too. This is what the paper's 5/3/3 is built from.
+#   two-way agreement    = a + d, counting "neither eliminated" as agreement. This is what
+#                          kappa is built from.
+pc <- wilson(t3[["a"]], t3[["a"]] + t3[["b"]])
+cat(sprintf("\nPOSITIVE CONCORDANCE: of the %d slots where the COS eliminated, %d also had at\n",
+            t3[["a"]] + t3[["b"]], t3[["a"]]))
+cat(sprintf("  least one equivalent DS eliminate = %.1f%% [%.1f, %.1f]\n",
+            100 * t3[["a"]] / (t3[["a"]] + t3[["b"]]),
+            100 * pc[["lower"]], 100 * pc[["upper"]]))
+cat("  ^ this is the quantity the published 5/3/3 classification rests on.\n")
+
+k2 <- kappa_2x2(t3[["a"]], t3[["b"]], t3[["c"]], t3[["d"]])
+cat(sprintf("\nTWO-WAY AGREEMENT over %d anatomical pairs from %d participants\n",
+            sum(t3), length(both_types)))
+cat("  (counts the", t3[["d"]], "slots where NEITHER eliminated as agreement)\n")
+cat(sprintf("raw agreement %.1f%% [%.1f, %.1f] | kappa %.2f [%.2f, %.2f] | PABAK %.2f\n",
+            100 * k2[["po"]], 100 * k2[["po_lower"]], 100 * k2[["po_upper"]],
+            k2[["kappa"]], k2[["kappa_lower"]], k2[["kappa_upper"]], k2[["pabak"]]))
+cat("\nTHREE LIMITS on this number, all reported alongside it:\n")
+cat("1. 'any equivalent DS eliminated' is not an even bar across rows: M2 has FOUR equivalents\n",
+    "   (11V,21V,31V,41V) while M1 and M3 have two. The M2 row's DS side therefore has twice\n",
+    "   the chances of coming out positive - the opportunity asymmetry again, inside this table.\n")
+cat("2. The COS margin is constrained by selection. The 11 were chosen for eliminating with\n",
+    "   BOTH types, so each must have >=1 COS eliminating among their 3 rows.\n")
+cat(sprintf("   observed COS-positive rows: %d of %d (arithmetic minimum %d)\n",
+            t3[["a"]] + t3[["b"]], sum(t3), length(both_types)))
+cat("3. The 33 pairs are 3 per participant, so they are NOT independent. This kappa ignores\n",
+    "   that clustering and its interval is therefore too narrow.\n")
+cat("\nReported because the reviewer asked for kappa. Descriptive only; the per-participant\n",
+    "classification above is the honest unit of analysis.\n")
+```
+
+# 7. The elimination endpoint against a reference rate
+
+**Decision (Esther, 2026-08-17): report an exact binomial test of 18/23 against a reference
+rate of 0.50, explicitly labelled exploratory, with the limitation stated.**
+
+Why this rather than McNemar. Restricted to the 23 participants who had a sound-induced VS,
+prevalence under sound is **100% by selection**, so the paired 2×2 has c = 0 forced — nobody in
+that subgroup could get worse in this coding. McNemar then reduces to p = 2/2^b, which makes any
+6 or more eliminators automatically significant regardless of what the stimuli did. A one-sample
+test against an external reference has no such degeneracy: the null lives outside the data.
+
+```{r elimination-degenerate}
+elig <- filter(per_pid, sound == 1)
+b_deg <- sum(elig$elim_any == 1); c_deg <- sum(elig$sound == 0)
+cat(sprintf("within the 23: b = %d, c = %d (forced), McNemar p = %.3g  <- degenerate\n",
+            b_deg, c_deg, binom.test(b_deg, b_deg + c_deg, 0.5)$p.value))
+cat("   with c = 0 this is 2/2^b, so >= 6 eliminators is always p < .05. Not reported.\n")
+```
+
+## The test as reported
+
+Interval is **Wilson**, for consistency with every other proportion in this project
+(`ANALYSIS_PLAN.md` analysis 2). The test is the **exact binomial**. Note these come from
+different families — a score interval and an exact test — so at the margin they could in
+principle disagree; here they agree, since the interval excludes 0.50 and p < .05.
+
+```{r elimination-test}
+x_el <- sum(per_pid$elim_any); n_el <- sum(per_pid$sound)
+bt   <- binom.test(x_el, n_el, 0.5)
+w_el <- wilson(x_el, n_el)
+
+cat(sprintf("Elimination of sound-induced VS: %d/%d = %.1f%%\n", x_el, n_el, 100*x_el/n_el))
+cat(sprintf("  95%% Wilson CI          : [%.1f%%, %.1f%%]   <- reported\n",
+            100*w_el[["lower"]], 100*w_el[["upper"]]))
+cat(sprintf("  95%% Clopper-Pearson    : [%.1f%%, %.1f%%]   (for reference only)\n",
+            100*bt$conf.int[1], 100*bt$conf.int[2]))
+cat(sprintf("  Exact binomial vs 0.50 : p = %.4f\n", bt$p.value))
+cat(sprintf("  Cohen's g              : %.3f\n", abs(x_el/n_el - 0.5)))
+```
+
+## The same endpoint, stimulus by stimulus
+
+The claim is about eliminating a sound-induced pseudo-scotoma, so the population is the 23 who
+had one and the question per stimulus is: **of those 23, how many did this stimulus clear?**
+This keeps the endpoint and the denominator identical to the collapsed analysis above and only
+changes how many stimuli are allowed to count — which is the comparison that matters for
+deciding whether the finding is about oral stimulation in general or about a person-specific
+search.
+
+Note this is **not** the sound-vs-sound+oral paired contrast. That contrast counts participants
+who acquired a pseudo-scotoma as well as those who lost one, and the 15 who never reacted to
+sound are not part of this claim. It is retained in
+`prevalence_ci_and_paired_contrasts.Rmd` as a secondary analysis of a broader question.
+
+```{r per-stimulus-elimination}
+reg_by_stim <- long |>
+  filter(block_type == "oral_plus_sound") |>
+  group_by(oral, type) |>
+  summarise(x = sum(classification == "regulador"), .groups = "drop") |>
+  rowwise() |>
+  mutate(n = n_el,
+         pct    = 100 * x / n,
+         lower  = 100 * wilson(x, n)[["lower"]],
+         upper  = 100 * wilson(x, n)[["upper"]],
+         p_vs50 = binom.test(x, n, 0.5)$p.value) |>
+  ungroup() |>
+  # Eleven tests on the same 23 people, so the family needs a multiplicity correction.
+  # Benjamini-Hochberg rather than Bonferroni: these are repeated measurements on one sample,
+  # so the tests are correlated and Bonferroni's independence assumption over-corrects.
+  mutate(p_bh = p.adjust(p_vs50, method = "BH")) |>
+  arrange(desc(pct))
+
+knitr::kable(reg_by_stim, digits = c(0,0,0,0,1,1,1,4,4),
+             caption = paste0("Elimination of sound-induced VS by each stimulus separately, out of the same ",
+                              n_el, " participants. p_vs50 is the exact binomial test against the 0.50 ",
+                              "reference; p_bh applies Benjamini-Hochberg across the eleven."))
+
+cat(sprintf("\nbefore correction, stimuli with p < .05 : %d of %d\n",
+            sum(reg_by_stim$p_vs50 < 0.05), nrow(reg_by_stim)))
+cat(sprintf("after Benjamini-Hochberg, p < .05      : %d of %d\n",
+            sum(reg_by_stim$p_bh < 0.05), nrow(reg_by_stim)))
+cat(sprintf("smallest adjusted p                    : %.3f\n", min(reg_by_stim$p_bh)))
+
+cat(sprintf("\nbest single stimulus : %s, %d/%d = %.1f%%\n",
+            reg_by_stim$oral[1], reg_by_stim$x[1], n_el, reg_by_stim$pct[1]))
+cat(sprintf("worst single stimulus: %s, %d/%d = %.1f%%\n",
+            tail(reg_by_stim$oral,1), tail(reg_by_stim$x,1), n_el, tail(reg_by_stim$pct,1)))
+cat(sprintf("any of the eleven    : %d/%d = %.1f%%\n", x_el, n_el, 100*x_el/n_el))
+cat(sprintf("stimuli reaching p < .05 against the 50%% reference: %d of %d",
+            sum(reg_by_stim$p_vs50 < 0.05), nrow(reg_by_stim)))
+cat(sprintf("  (all of them BELOW 50%%, not above: %s)\n",
+            paste(reg_by_stim$oral[reg_by_stim$p_vs50 < 0.05], collapse = ", ")))
+cat(sprintf("stimuli exceeding 50%%: %d of %d\n",
+            sum(reg_by_stim$pct > 50), nrow(reg_by_stim)))
+```
+
+**This is the key comparison for the Discussion.** No single stimulus comes close to the
+collapsed figure: the best is 31V at 12/23 = 52.2% [33.0, 70.8], and three (11V, 21P, 21V) sit
+significantly **below** the 50% reference at 26.1%. Only one of the eleven exceeds 50% at all, and
+not detectably so (p = 1.00).
+
+So the 78.3% is produced by allowing *any* of eleven stimuli to count. **That makes it a claim
+about a person-specific search — that for most people some stimulus can be found — rather than a
+claim that oral proprioceptive stimulation has a general effect.** Both are defensible; only the
+first is supported.
+
+## ⚠️ The limitation, quantified
+
+The reference value of 0.50 is a **convention, not an empirical no-effect rate.** Because the
+sound-only condition was presented once, the rate at which a sound-induced VS would clear
+spontaneously on re-testing is not estimable from these data (§2a.4). Two things show how much
+turns on it.
+
+**First, where the result changes.** The same 18/23 tested against other reference rates:
+
+```{r benchmark-sensitivity}
+bench <- data.frame(reference = c(.30, .40, .50, .56, .60, .65, .70, .80)) |>
+  rowwise() |>
+  mutate(p = binom.test(x_el, n_el, reference)$p.value,
+         significant = ifelse(p < 0.05, "yes", "no")) |>
+  ungroup()
+knitr::kable(bench, digits = 4,
+             caption = "Exact binomial test of 18/23 against a range of reference rates")
+```
+
+**Second, what a lenient endpoint plus eleven attempts can produce on its own.** Most of the 23
+had only a few of the 12 drawings affected, and "elimination" needed just one of 11 stimuli to
+clear all of them. If the reports were unrelated to the stimulus, with *q* the chance an
+affected drawing reads clear on a re-read:
+
+```{r noise-illustration}
+k_burden <- long |> filter(block_type == "sound_only", any_vs == 1) |> pull(n_im)
+cat("drawings affected under sound, among the 23:\n"); print(table(k_burden))
+cat(sprintf("median %.0f of 12; %d of %d had only 1-2 affected\n\n",
+            median(k_burden), sum(k_burden <= 2), length(k_burden)))
+
+noise <- data.frame(q = c(.10, .20, .30, .40, .50)) |>
+  rowwise() |>
+  mutate(expected_elimination_pct = round(100 * mean(1 - (1 - q^k_burden)^11), 1)) |>
+  ungroup()
+knitr::kable(noise,
+             caption = "Expected 'elimination' rate with NO stimulus effect, by per-drawing instability q")
+```
+
+Assumes independence across drawings and across conditions; positive within-condition
+correlation would push these higher, since one clean trial clears everything at once. **At
+q = 0.5 the no-effect rate is already ~59%, above the 0.50 being tested against.** That is the
+substance of the limitation, and it is why this analysis is exploratory.
+
+## Wording for the manuscript and the reply
+
+Drafted here so the same phrasing is used in both. Esther to edit.
+
+> **Limitations.** The proportion of participants in whom oral proprioceptive stimulation
+> eliminated the sound-induced pseudo-scotoma (18/23; 78.3%, 95% CI 58.1–90.3%) was compared
+> against a reference value of 50% using an exact binomial test (*p* = .011). This reference is
+> a conventional benchmark rather than an empirically established one: because the sound-only
+> condition was presented once, the rate at which a sound-induced pseudo-scotoma resolves
+> spontaneously on re-testing could not be estimated in this study. This analysis is therefore
+> exploratory. The confidence interval indicates that the observed rate is **not compatible with
+> a spontaneous resolution rate below approximately 56%, but is fully compatible with rates of
+> 60% or above.** Establishing the spontaneous resolution rate — for example by presenting the
+> sound-only condition repeatedly within a session — would be necessary before this finding
+> could be attributed specifically to oral proprioceptive stimulation.
+
+For the response letter, shorter:
+
+> We have added an exact binomial test of the elimination proportion against a 50% reference
+> value (18/23; 78.3%, 95% CI 58.1–90.3%; *p* = .011), together with Wilson confidence intervals
+> for all reported proportions and McNemar's test for the paired condition comparisons. We note
+> explicitly that the 50% reference is conventional rather than empirical, since the sound-only
+> condition was presented once and the spontaneous resolution rate could not be estimated; the
+> analysis is presented as exploratory and this limitation is now stated in the Discussion.
+
+# 8. Outputs
+
+```{r write}
+tab_dir <- file.path("..", "outputs", "tables")
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(paper_tbl, file.path(tab_dir, "manuscript_percentages_wilson.csv"), row.names = FALSE)
+
+collapsed <- tibble(
+  comparison = c("Sound vs OPS (any)", "DS vs COS elimination, of the 23"),
+  p1 = c(100 * (tab[["a"]] + tab[["b"]]) / 38, 100 * (t2[["a"]] + t2[["b"]]) / 23),
+  p2 = c(100 * (tab[["a"]] + tab[["c"]]) / 38, 100 * (t2[["a"]] + t2[["c"]]) / 23),
+  rd = c(100 * nc[["rd"]], 100 * nc2[["rd"]]),
+  rd_lower = c(100 * nc[["lower"]], 100 * nc2[["lower"]]),
+  rd_upper = c(100 * nc[["upper"]], 100 * nc2[["upper"]]),
+  discordant = c(mc[["discordant"]], mc2[["discordant"]]),
+  p_exact_mcnemar = c(mc[["p"]], mc2[["p"]])
+)
+write.csv(collapsed, file.path(tab_dir, "collapsed_comparisons.csv"), row.names = FALSE)
+
+kappa_row <- function(label, k) data.frame(analysis = label, as.list(round(k, 4)),
+                                          check.names = FALSE)
+write.csv(
+  rbind(kappa_row("DS vs COS elimination (n=23 participants)", k1),
+        kappa_row("COS vs equivalent DS (anatomical pairs, clustered)", k2)),
+  file.path(tab_dir, "agreement_kappa.csv"), row.names = FALSE)
+
+write.csv(summary_tbl, file.path(tab_dir, "concordance_readings.csv"), row.names = FALSE)
+
+write.csv(
+  data.frame(
+    x = x_el, n = n_el, pct = round(100 * x_el / n_el, 1),
+    wilson_lower = round(100 * w_el[["lower"]], 1),
+    wilson_upper = round(100 * w_el[["upper"]], 1),
+    cp_lower = round(100 * bt$conf.int[1], 1),
+    cp_upper = round(100 * bt$conf.int[2], 1),
+    reference = 0.50, p_exact_binomial = round(bt$p.value, 4),
+    cohens_g = round(abs(x_el / n_el - 0.5), 3),
+    status = "exploratory - reference rate is conventional, not empirical"
+  ),
+  file.path(tab_dir, "elimination_benchmark.csv"), row.names = FALSE)
+
+write.csv(bench,  file.path(tab_dir, "elimination_benchmark_sensitivity.csv"), row.names = FALSE)
+write.csv(noise,  file.path(tab_dir, "elimination_noise_illustration.csv"), row.names = FALSE)
+
+write.csv(
+  data.frame(phases = c(3, 4), Q = c(q3[["Q"]], q4[["Q"]]), df = c(q3[["df"]], q4[["df"]]),
+             p = c(q3[["p"]], q4[["p"]]),
+             note = c("three measurable phases",
+                      "includes the asserted all-zero baseline - inflated, for the record only")),
+  file.path(tab_dir, "cochran_q.csv"), row.names = FALSE)
+
+cat("wrote manuscript_percentages_wilson.csv, collapsed_comparisons.csv, agreement_kappa.csv,\n",
+    "concordance_readings.csv, cochran_q.csv\n")
+```
+
+```{r session}
+sessionInfo()
+```

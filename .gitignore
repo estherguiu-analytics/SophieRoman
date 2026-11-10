@@ -1,0 +1,138 @@
+# ---------------------------------------------------------------
+# RoseCentre .gitignore
+#
+# Principle: git tracks CODE and REASONING (.Rmd, .R, CLAUDE.md,
+# ANALYSIS_PLAN.md, MANUSCRIPT.md, README.md). Data and anything
+# regenerable from code stays in OneDrive, out of git.
+# ---------------------------------------------------------------
+
+# --- Data ----------------------------------------------------
+# Size, and often participant-confidential. OneDrive holds these.
+**/data/raw/**
+**/data/processed/**
+**/data/interim/**
+**/data/original/**
+
+*.csv
+*.xlsx
+*.xls
+*.sav
+*.dta
+*.rds
+*.parquet
+
+# --- R session state -----------------------------------------
+# Hidden state is the enemy of reproducibility: every .Rmd must
+# run from a clean session.
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# --- Rendered / regenerable output ----------------------------
+# Regenerable from src/. Keeping them out avoids diff noise and
+# avoids two copies drifting apart.
+*.html
+*_cache/
+
+# knitr/rmarkdown asset directories. Deliberately NOT a blanket `*_files/`:
+# Maddie's CNV_reliability_analysis_files/ had been repurposed to hold real
+# .Rmd/.R/.csv/.xlsx source, and a blanket rule hid it from the 2026-08-04
+# baseline commit entirely. Match the generated subdirectories instead, so a
+# `_files/` folder containing actual source still shows up in `git status`.
+**/*_files/figure-html/
+**/*_files/figure-latex/
+**/*_files/figure-gfm/
+**/*_files/figure-markdown*/
+**/*_files/libs/
+**/*_files/*.html
+*.knit.md
+*.utf8.md
+Rplots.pdf
+
+# Figures and rendered reports. Binary, don't diff, and every one
+# is regenerable from the .Rmd that git DOES track.
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.svg
+*.pdf
+
+# LaTeX intermediates
+*.aux
+*.log
+*.synctex.gz
+*.out
+*.toc
+
+# --- Manuscripts ---------------------------------------------
+# git cannot diff Word usefully. Version history lives in
+# manuscript/drafts/ filenames and OneDrive.
+*.docx
+*.doc
+
+# --- Scratch --------------------------------------------------
+scratch/
+tmp_*
+temp_*
+*.tmp
+
+# Extensionless PNG dumped by a bare R plot() call
+**/plot
+
+# --- Python ---------------------------------------------------
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# --- Secrets --------------------------------------------------
+.env
+*.key
+
+# --- Claude Code ----------------------------------------------
+# The shared harness moved up to EGH_analytics/ on 2026-08-10 and is
+# versioned in the repo there -- skills/, agents/ and templates/ are
+# no longer in this repository. What remains here is a fallback
+# settings.json for anyone who opens RoseCentre/ directly.
+.claude/settings.local.json
+
+# --- OS -------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Exceptions ----------------------------------------------
+# Each project's research questions + hypotheses. Small, and it
+# defines the project's scope, so it IS versioned despite *.xlsx.
+# git can't diff it usefully -- the reasoning belongs in the
+# ANALYSIS_PLAN.md files, which are diffable.
+!**/RESEARCH_QUESTIONS.xlsx
+
+# Other small reference tables worth versioning can be force-added:
+#   git add -f path/to/file.csv
+
+# --- data and outputs never enter git (added 2026-11-10) ---
+.claude/worktrees/
+**/outputs/
+**/data/**
+!**/data/**/
+!**/data/**/README.md
+!**/data/**/*.R
+!**/data/**/*.r
+*.csv
+*.sav
+*.rds
+*.RData
+*.rda
+*.dta
+*.mat
+*.wav
+*.xls
+*.xlsx
+!**/RESEARCH_QUESTIONS*.xlsx
+Figure_prevalence_files/

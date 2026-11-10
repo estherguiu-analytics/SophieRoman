@@ -1,0 +1,1029 @@
+---
+title: "Study 1 - condition inventory, collapsed summary and regulador/perturbador classification"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(readxl); library(dplyr); library(tidyr); library(stringr); library(ggplot2)
+```
+
+# Purpose
+
+Collapse the 12 per-image binary columns of every condition block down to **one summary
+variable per participant per condition**, and apply the regulador / perturbador
+classification rule to each sound + oral condition.
+
+Three rules, one per block type, applied to every block found in the workbook:
+
+| Block type | Rule |
+|---|---|
+| Sound-only (`E1`) | `1` if any of the 12 images shows a 1, else `0` |
+| Sound + oral (`E2`-`E12`) | `regulador` / `perturbador` / `no clasificado`, relative to that participant's own sound-only result |
+| Oral alone, no sound (`E13`-`E23`) | `1` if any of the 12 images shows a 1, else `0`, plus a Spanish label |
+
+**Descriptive only. No inferential statistics are run here and none may be run until
+`ANALYSIS_PLAN.md` is agreed** — see §10 of that file, where this script is logged. The
+classification is a *re-description* of the raw grid, not a test.
+
+⚠️ Two properties of the classification rule govern how its output may be read. They are
+stated here because the numbers below are meaningless without them, and repeated in
+`ANALYSIS_PLAN.md` §2a.8-9.
+
+1. **Both labels condition on a single, unrepeated measurement of `E1`.** Regulador selects
+   participants who read positive under sound and asks whether they later read negative;
+   perturbador selects those who read negative and asks whether they later read positive.
+   Under pure response instability, with no stimulus effect whatever, both groups are
+   non-empty by construction. `E1` was presented once, so that instability is not estimable
+   from this file.
+2. **The two criteria are not equally exposed to that instability.** Regulador requires *all
+   12* images to read 0 — a conjunction of 12 events. Perturbador requires *any 1 of 12* to
+   read 1 — a disjunction. The perturbador rate therefore runs higher than the regulador
+   rate for arithmetic reasons alone. **The two counts have different denominators, are not
+   comparable to each other, and must never be summed.** Both denominators are carried in
+   every output below so that cannot happen silently.
+
+# Load
+
+The workbook is read-only source. It is copied out before reading, never opened in place.
+
+```{r load}
+raw_dir <- file.path("..", "..", "data", "raw")
+xl <- list.files(raw_dir, pattern = "\\.xlsx$", full.names = TRUE)
+stopifnot(length(xl) == 1)
+
+# The workbook is often open in Excel, and then cannot be read in place by any ordinary
+# route. readable_copy() falls through three of them; see src/readable_copy.R.
+source("readable_copy.R")
+
+xlc <- readable_copy(xl)
+
+# Sheet row 1 is a merged group header naming each condition block; row 2 carries the column
+# names. skip = 1 makes row 2 the header.
+d <- read_excel(xlc, sheet = "Datos", skip = 1)
+names(d)[1:4] <- c("row_index", "pid", "sex", "age")
+
+cat("participants:", nrow(d), " columns:", ncol(d), "\n")
+```
+
+# 1. Condition block inventory
+
+The set of blocks is read **from the workbook**, not hardcoded, so a block added to the file
+appears here rather than being silently dropped.
+
+Row 1 is read back at exactly the width of the data so the two rows stay index-aligned, then
+the merged group-header labels are filled forward across the columns they span — which is
+what a merged cell means.
+
+```{r inventory}
+gh <- as.character(unlist(read_excel(
+  xlc, sheet = "Datos", col_names = FALSE, .name_repair = "minimal",
+  range = cell_limits(c(1, 1), c(1, ncol(d)))
+)))
+stopifnot(length(gh) == ncol(d))
+
+# fill merged group-header labels forward
+for (i in seq_along(gh)) {
+  if (is.na(gh[i]) || trimws(gh[i]) == "") gh[i] <- if (i > 1) gh[i - 1] else NA_character_
+}
+
+grid_idx  <- 5:ncol(d)
+grid_cols <- names(d)[grid_idx]
+
+blocks <- tibble(
+  col   = grid_cols,
+  label = gh[grid_idx],
+  # "ESTIMULO 2 = M1 + SONIDO" -> number 2, condition "M1 + SONIDO"
+  e_hdr = as.integer(str_match(label, "(?i)EST[ÍI]MULO\\s*(\\d+)")[, 2]),
+  cond  = str_trim(str_match(label, "=\\s*(.*)$")[, 2]),
+  # the column's own name carries the condition number too: "IM3 E2"
+  im    = as.integer(str_match(col, "^IM\\s*(\\d+)")[, 2]),
+  e_col = as.integer(str_match(col, "E(\\d+)$")[, 2])
+)
+
+# The two independent sources of the condition number must agree for every column. If a block
+# were mis-spanned in the sheet, or the columns were out of order, this is where it surfaces.
+mismatch <- filter(blocks, is.na(e_hdr) | is.na(e_col) | e_hdr != e_col)
+if (nrow(mismatch)) {
+  print(mismatch)
+  stop(nrow(mismatch), " columns where the group header and the column name disagree ",
+       "about which condition they belong to")
+}
+stopifnot(all(!is.na(blocks$im)), all(blocks$im %in% 1:12))
+
+inventory <- blocks |>
+  group_by(e = e_col, cond) |>
+  summarise(n_images = n(), images = paste0("IM", min(im), "-IM", max(im)), .groups = "drop") |>
+  mutate(
+    block_type = case_when(
+      str_detect(cond, "(?i)^solo\\s+sonido$") ~ "sound_only",
+      str_detect(cond, "(?i)\\+\\s*SONIDO$")   ~ "oral_plus_sound",
+      TRUE                                      ~ "oral_alone"
+    ),
+    # the oral stimulus identity, shared by a with-sound block and its no-sound counterpart
+    oral = if_else(block_type == "sound_only", NA_character_,
+                   str_trim(str_remove(cond, "(?i)\\s*\\+\\s*SONIDO$"))),
+    type = case_when(
+      block_type == "sound_only" ~ "Sound",
+      oral %in% c("M1", "M2", "M3") ~ "COS",
+      TRUE ~ "DS"
+    )
+  ) |>
+  arrange(e)
+
+# Every block must be a full 12 images, and every block type must be represented.
+stopifnot(all(inventory$n_images == 12))
+stopifnot(sum(inventory$block_type == "sound_only") == 1)
+
+knitr::kable(inventory, caption = "Condition blocks found in the workbook")
+
+cat("\nblocks:", nrow(inventory),
+    "| sound-only:", sum(inventory$block_type == "sound_only"),
+    "| sound + oral:", sum(inventory$block_type == "oral_plus_sound"),
+    "| oral alone:", sum(inventory$block_type == "oral_alone"), "\n")
+cat("binary cells:", nrow(d) * nrow(inventory) * 12, "\n")
+```
+
+⚠️ **There is no baseline (no-stimulus) block.** The grid begins at `E1` = sound. The
+paper's 0/38 at baseline is not in this file and cannot be rebuilt from it
+(`ANALYSIS_PLAN.md` §2a.5).
+
+Every sound + oral block must have a no-sound counterpart with the same oral stimulus, or the
+phase-4 follow-up in §5 has nothing to match against.
+
+```{r pairing}
+paired <- inventory |>
+  filter(block_type != "sound_only") |>
+  select(e, oral, block_type) |>
+  pivot_wider(names_from = block_type, values_from = e)
+
+stopifnot(!any(is.na(paired$oral_plus_sound)), !any(is.na(paired$oral_alone)))
+knitr::kable(paired, caption = "Each oral stimulus, with sound and without")
+```
+
+# 2. Validate the grid
+
+```{r validate}
+vals <- unlist(d[grid_cols])
+cat("distinct values in the grid:", paste(sort(unique(vals)), collapse = ", "), "\n")
+cat("missing cells:", sum(is.na(vals)), "\n")
+stopifnot(all(vals %in% c(0, 1)))
+
+stopifnot(!any(is.na(d$pid)), !anyDuplicated(d$pid))
+cat("participant key unique:", nrow(d), "rows,", n_distinct(d$pid), "distinct IDs\n")
+cat("sex 1=male 2=female:", paste(names(table(d$sex)), table(d$sex), sep = "="), "\n")
+cat("age: mean", round(mean(d$age), 1), "SD", round(sd(d$age), 1),
+    "range", min(d$age), "-", max(d$age), "\n")
+```
+
+# 3. Collapse each block to one value per participant
+
+```{r collapse}
+long_cell <- d |>
+  select(pid, sex, age, all_of(grid_cols)) |>
+  pivot_longer(all_of(grid_cols), names_to = "col", values_to = "vs") |>
+  left_join(select(blocks, col, e = e_col, im), by = "col")
+
+stopifnot(nrow(long_cell) == nrow(d) * nrow(inventory) * 12)
+
+# one row per participant x condition
+by_cond <- long_cell |>
+  group_by(pid, sex, age, e) |>
+  summarise(n_im = sum(vs), any_vs = as.integer(n_im > 0), .groups = "drop") |>
+  left_join(select(inventory, e, cond, block_type, oral, type), by = "e")
+
+stopifnot(nrow(by_cond) == nrow(d) * nrow(inventory))
+cat("condition-level rows:", nrow(by_cond), "\n")
+```
+
+# 4. Classify each sound + oral condition
+
+The rule, per participant and per sound + oral condition, against that participant's own
+sound-only result:
+
+- **regulador** — `any_vs == 1` under sound alone **and** all 12 images read 0 under
+  sound + oral.
+- **perturbador** — `any_vs == 0` under sound alone **and** at least one image reads 1 under
+  sound + oral.
+- **no clasificado** — everything else. Not forced into either label.
+
+`no clasificado` merges two situations that are not the same thing, so the reason is kept in
+its own column rather than lost:
+
+| `class_reason` | Meaning |
+|---|---|
+| `vs_en_ambas` | VS under sound alone **and** still VS under sound + oral — includes partial improvement, no change, and worsening |
+| `sin_vs_en_ninguna` | no VS under either condition — the stimulus had nothing to change |
+
+⚠️ Note what the rule cannot see. A participant with VS under sound whose VS *spreads to more
+images* under sound + oral is `vs_en_ambas` — the same cell as no change at all. Because
+eligibility for each label is fixed by `E1`, **a participant can never be both regulador and
+perturbador.** That mutual exclusivity is a property of the rule, not a finding about two
+participant types.
+
+```{r classify}
+sound_only <- by_cond |>
+  filter(block_type == "sound_only") |>
+  select(pid, vs_sound = any_vs, n_im_sound = n_im)
+
+stopifnot(nrow(sound_only) == nrow(d))
+
+classified <- by_cond |>
+  left_join(sound_only, by = "pid") |>
+  mutate(
+    class_reason = case_when(
+      block_type != "oral_plus_sound"        ~ NA_character_,
+      vs_sound == 1 & any_vs == 0            ~ "regulador",
+      vs_sound == 0 & any_vs == 1            ~ "perturbador",
+      vs_sound == 1 & any_vs == 1            ~ "vs_en_ambas",
+      vs_sound == 0 & any_vs == 0            ~ "sin_vs_en_ninguna"
+    ),
+    classification = factor(
+      case_when(
+        block_type != "oral_plus_sound" ~ NA_character_,
+        class_reason %in% c("regulador", "perturbador") ~ class_reason,
+        TRUE ~ "no clasificado"
+      ),
+      levels = c("regulador", "perturbador", "no clasificado")
+    ),
+    vs_label = if_else(any_vs == 1, "escotoma presente", "escotoma no presente")
+  )
+
+stopifnot(!any(is.na(classified$class_reason[classified$block_type == "oral_plus_sound"])))
+```
+
+## The two denominators
+
+Eligibility for each label is decided entirely by the sound-only column, so the denominators
+are fixed before any oral stimulus is considered.
+
+```{r denominators}
+n_total  <- nrow(sound_only)
+n_sound  <- sum(sound_only$vs_sound == 1)   # eligible to be regulador
+n_nosnd  <- sum(sound_only$vs_sound == 0)   # eligible to be perturbador
+stopifnot(n_sound + n_nosnd == n_total)
+
+cat("participants:", n_total, "\n")
+cat("VS under sound alone  -> eligible for REGULADOR only:  ", n_sound, "\n")
+cat("no VS under sound alone -> eligible for PERTURBADOR only:", n_nosnd, "\n")
+```
+
+## Counts per condition
+
+```{r counts-per-condition}
+# A label with no occurrences anywhere would otherwise be an absent column rather than a zero,
+# and every downstream reference to it would fail. Guarantee all of them.
+ensure_cols <- function(df, cols) {
+  for (cn in cols) if (!cn %in% names(df)) df[[cn]] <- 0L
+  df
+}
+
+counts <- classified |>
+  filter(block_type == "oral_plus_sound") |>
+  count(e, oral, type, classification) |>
+  pivot_wider(names_from = classification, values_from = n, values_fill = 0) |>
+  ensure_cols(c("regulador", "perturbador", "no clasificado")) |>
+  left_join(
+    classified |>
+      filter(block_type == "oral_plus_sound") |>
+      count(e, class_reason) |>
+      pivot_wider(names_from = class_reason, values_from = n, values_fill = 0) |>
+      ensure_cols(c("vs_en_ambas", "sin_vs_en_ninguna")) |>
+      select(e, vs_en_ambas, sin_vs_en_ninguna),
+    by = "e"
+  ) |>
+  mutate(
+    n_eligible_regulador  = n_sound,
+    n_eligible_perturbador = n_nosnd,
+    pct_regulador   = round(100 * regulador / n_sound, 1),
+    pct_perturbador = round(100 * perturbador / n_nosnd, 1)
+  ) |>
+  arrange(e)
+
+knitr::kable(counts, caption = paste0(
+  "Classification by sound + oral condition. Percentages use different denominators: ",
+  "regulador of ", n_sound, ", perturbador of ", n_nosnd, "."
+))
+```
+
+## Participant-level rollup
+
+Whether each participant was *ever* classified either way across the eleven sound + oral
+conditions. This is the level the manuscript reports at.
+
+```{r rollup}
+rollup <- classified |>
+  filter(block_type == "oral_plus_sound") |>
+  group_by(pid) |>
+  summarise(
+    vs_sound          = first(vs_sound),
+    n_regulador       = sum(classification == "regulador"),
+    n_perturbador     = sum(classification == "perturbador"),
+    ever_regulador    = as.integer(n_regulador > 0),
+    ever_perturbador  = as.integer(n_perturbador > 0),
+    .groups = "drop"
+  )
+
+cat("ever regulador:  ", sum(rollup$ever_regulador), "of", n_sound, "eligible\n")
+cat("ever perturbador:", sum(rollup$ever_perturbador), "of", n_nosnd, "eligible\n")
+cat("both (impossible by construction):", sum(rollup$ever_regulador & rollup$ever_perturbador), "\n")
+stopifnot(sum(rollup$ever_regulador & rollup$ever_perturbador) == 0)
+```
+
+### Cross-check against the published elimination endpoint
+
+The regulador rule is, word for word, the "elimination of sound-induced VS" endpoint already
+rebuilt in `reconcile_published_counts.Rmd` — VS under sound alone, then no VS in any of the
+12 drawings once an oral stimulus is added. So the participant-level regulador count must
+reproduce the published **18 of 23**. If it does not, one of the two scripts is wrong.
+
+```{r crosscheck}
+cat("regulador (participant level):", sum(rollup$ever_regulador), "/", n_sound, "\n")
+cat("published elimination endpoint: 18 / 23\n")
+
+if (sum(rollup$ever_regulador) == 18 && n_sound == 23) {
+  cat("MATCH - the regulador rule is the published elimination endpoint.\n")
+} else {
+  cat("*** MISMATCH - reconcile before anything downstream uses this. ***\n")
+}
+```
+
+# 5. Does the oral stimulus disrupt without sound?
+
+The phase-4 follow-up on the perturbador classifications: where an oral stimulus induced a VS
+*with* sound present, did **the same stimulus** induce one with the sound off?
+
+Matched on the oral stimulus, not on a `+11` offset, so it stays correct if the block order
+changes.
+
+```{r phase4}
+oral_alone <- classified |>
+  filter(block_type == "oral_alone") |>
+  select(pid, oral, vs_alone = any_vs, n_im_alone = n_im)
+
+perturb_follow <- classified |>
+  filter(block_type == "oral_plus_sound", classification == "perturbador") |>
+  select(pid, oral, e, n_im_with_sound = n_im) |>
+  left_join(oral_alone, by = c("pid", "oral"))
+
+stopifnot(!any(is.na(perturb_follow$vs_alone)))
+
+cat("perturbador classifications (participant x stimulus):", nrow(perturb_follow), "\n")
+if (nrow(perturb_follow) > 0) {
+  cat("  ...of which the same stimulus alone, no sound, also induced a VS:",
+      sum(perturb_follow$vs_alone), "\n")
+}
+
+knitr::kable(
+  perturb_follow |>
+    count(oral, vs_alone) |>
+    pivot_wider(names_from = vs_alone, values_from = n, values_fill = 0,
+                names_prefix = "vs_alone_") |>
+    arrange(oral),
+  caption = "Perturbador classifications, by whether the same oral stimulus disrupted without sound"
+)
+```
+
+⚠️ This follow-up selects a subgroup on a noisy criterion and then re-tests it in a phase that
+**always came later** (`ANALYSIS_PLAN.md` §2a.1), with no comparison group and no correction.
+It can only ever confirm. It is reported as a description of what those participants did, and
+carries no inferential weight.
+
+# 6. Outputs
+
+## Wide summary — one row per participant
+
+```{r write-wide}
+safe <- function(x) str_replace_all(str_to_lower(str_replace_all(x, "[ +]+", "_")),
+                                   "[^a-z0-9_]", "")
+
+col_for <- function(e, cond, suffix = "") {
+  paste0("E", e, "_", safe(cond), suffix)
+}
+
+snd <- filter(inventory, block_type == "sound_only")
+wide_sound <- classified |>
+  filter(block_type == "sound_only") |>
+  select(pid, any_vs)
+names(wide_sound)[2] <- col_for(snd$e, snd$cond)
+
+wide_class <- classified |>
+  filter(block_type == "oral_plus_sound") |>
+  select(pid, e, cond, classification) |>
+  mutate(name = col_for(e, cond, "_class")) |>
+  select(pid, name, classification) |>
+  pivot_wider(names_from = name, values_from = classification)
+
+wide_alone_bin <- classified |>
+  filter(block_type == "oral_alone") |>
+  select(pid, e, cond, any_vs) |>
+  mutate(name = col_for(e, cond, "_vs")) |>
+  select(pid, name, any_vs) |>
+  pivot_wider(names_from = name, values_from = any_vs)
+
+wide_alone_lab <- classified |>
+  filter(block_type == "oral_alone") |>
+  select(pid, e, cond, vs_label) |>
+  mutate(name = col_for(e, cond, "_vs_label")) |>
+  select(pid, name, vs_label) |>
+  pivot_wider(names_from = name, values_from = vs_label)
+
+summary_wide <- d |>
+  transmute(pid, sex, sex_label = if_else(sex == 1, "hombre", "mujer"), age) |>
+  left_join(wide_sound,     by = "pid") |>
+  left_join(wide_class,     by = "pid") |>
+  left_join(wide_alone_bin, by = "pid") |>
+  left_join(wide_alone_lab, by = "pid") |>
+  arrange(pid)
+
+stopifnot(nrow(summary_wide) == nrow(d), !any(is.na(summary_wide)))
+
+proc <- file.path("..", "..", "data", "processed")
+dir.create(proc, recursive = TRUE, showWarnings = FALSE)
+write.csv(summary_wide, file.path(proc, "participant_condition_summary.csv"),
+          row.names = FALSE)
+
+cat("participant_condition_summary.csv:", nrow(summary_wide), "x", ncol(summary_wide), "\n")
+knitr::kable(summary_wide[1:6, 1:9], caption = "Wide summary, first 6 participants")
+```
+
+## Long form — one row per participant x condition
+
+The analysis substrate: this is the shape a model is fitted to, and it carries the reason
+column and the labels.
+
+```{r write-long}
+summary_long <- classified |>
+  transmute(
+    pid, sex, sex_label = if_else(sex == 1, "hombre", "mujer"), age,
+    e, condition = cond, block_type, oral, type,
+    n_im, any_vs, vs_label,
+    vs_sound, classification, class_reason
+  ) |>
+  arrange(pid, e)
+
+write.csv(summary_long, file.path(proc, "participant_condition_long.csv"), row.names = FALSE)
+cat("participant_condition_long.csv:", nrow(summary_long), "x", ncol(summary_long), "\n")
+```
+
+## Classification counts table
+
+```{r write-counts}
+tab <- file.path("..", "outputs", "tables")
+dir.create(tab, recursive = TRUE, showWarnings = FALSE)
+write.csv(counts, file.path(tab, "condition_classification_counts.csv"), row.names = FALSE)
+
+write.csv(rollup, file.path(tab, "participant_classification_rollup.csv"), row.names = FALSE)
+cat("wrote condition_classification_counts.csv and participant_classification_rollup.csv\n")
+```
+
+# 7. Figure
+
+## Colour decisions
+
+Recorded because they are choices, not defaults, and continuous with
+`vs_matrices_and_heatmaps.Rmd`.
+
+**Regulador vs perturbador is a polarity, not two nominal categories** — one label is a VS
+removed, the other a VS induced — so it takes a **diverging pair**: one cool pole, one warm,
+never two arbitrary hues and never red/green. `#2a78d6` is the blue already used for "VS
+present" in the existing heatmaps, kept so the two figures read as one system; `#c2610f` is
+its warm counterpart.
+
+Validated with the `dataviz` palette validator against surface `#fcfcfb`: lightness band,
+chroma floor, CVD separation and contrast all pass, worst adjacent pair ΔE **26.5** under
+protanopia and **30.5** at normal vision — far above the ΔE 8 target. The pair also separates
+on lightness, so it survives greyscale printing.
+
+**No legend, because the panel headings name the two labels.** Identity is therefore carried
+by text rather than by colour, which is what the accessibility rule actually asks for; a
+legend as well would be pure redundancy. Counts are direct-labelled on every bar and the same
+numbers are in `condition_classification_counts.csv`, so no value is reachable only by colour.
+
+**Two panels rather than two bars per stimulus.** The two counts share a unit but not a
+denominator, and a shared axis would invite the reader to compare bar lengths across labels —
+the one comparison this classification does not license.
+
+```{r figure, fig.width=9, fig.height=6, dpi=300}
+col_regulador   <- "#2a78d6"
+col_perturbador <- "#c2610f"
+surface     <- "#fcfcfb"
+ink_muted   <- "#898781"
+ink_primary <- "#0b0b0b"
+
+plot_dat <- counts |>
+  select(oral, type, regulador, perturbador) |>
+  pivot_longer(c(regulador, perturbador), names_to = "label", values_to = "n") |>
+  mutate(
+    # Small multiples, not two bars on one axis. The counts share a unit (participants) but
+    # NOT a denominator, so putting them on one shared axis would invite exactly the
+    # length-comparison the caption has to forbid. Each panel carries its own denominator.
+    panel = factor(
+      if_else(label == "regulador",
+              paste0("Regulador — of the ", n_sound, " with a pseudo-scotoma under sound alone"),
+              paste0("Perturbador — of the ", n_nosnd, " without one")),
+      levels = c(paste0("Regulador — of the ", n_sound,
+                        " with a pseudo-scotoma under sound alone"),
+                 paste0("Perturbador — of the ", n_nosnd, " without one"))
+    ),
+    oral_f = factor(oral, levels = rev(counts$oral))   # workbook order, top to bottom
+  )
+
+p_class <- ggplot(plot_dat, aes(n, oral_f, fill = label)) +
+  geom_col(width = 0.62, colour = surface, linewidth = 0.5) +
+  geom_text(aes(label = n), hjust = -0.4, size = 2.9, colour = ink_muted) +
+  facet_wrap(~ panel) +
+  scale_fill_manual(values = c(regulador = col_regulador, perturbador = col_perturbador),
+                    guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.14))) +
+  labs(
+    title    = "Regulador and perturbador classifications, by oral stimulus",
+    subtitle = paste0("Participants classified under each of the 11 oral stimuli, ",
+                      "sound maintained. n = ", n_total, ".\n",
+                      "The two panels have different denominators and are not comparable ",
+                      "to each other."),
+    x = "Participants classified", y = "Oral stimulus",
+    caption = paste0(
+      "Panels are separated because they do not share a denominator: eligibility for each ",
+      "label is fixed by the sound-only condition,\n",
+      "so the ", n_sound, " participants who could be classified regulador and the ", n_nosnd,
+      " who could be classified perturbador are disjoint groups.\n",
+      "Regulador also requires all 12 images to clear, while perturbador requires only 1 of 12 ",
+      "to appear, so perturbador counts run higher for arithmetic reasons alone.\n",
+      "Descriptive re-description of the raw grid; no test is implied. ",
+      "Values in outputs/tables/condition_classification_counts.csv"
+    )
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_line(colour = "#e8e6e2", linewidth = 0.3),
+    panel.spacing.x    = unit(18, "pt"),
+    strip.text         = element_text(colour = ink_primary, face = "bold", size = 8.5),
+    axis.text          = element_text(colour = ink_muted),
+    axis.title         = element_text(colour = ink_muted, size = 9),
+    plot.title         = element_text(colour = ink_primary, face = "bold", size = 12),
+    plot.subtitle      = element_text(colour = ink_muted, size = 8.5),
+    plot.caption       = element_text(colour = ink_muted, size = 7, hjust = 0),
+    plot.background    = element_rect(fill = surface, colour = NA)
+  )
+p_class
+
+fig <- file.path("..", "outputs", "figures")
+dir.create(fig, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(fig, "classification_by_oral_stimulus.png"), p_class,
+       width = 9, height = 6, dpi = 300, bg = surface)
+```
+
+# 8. Heatmaps
+
+## Colour decisions for the classification states
+
+Red for perturbador and green for regulador are **Esther's choice, 2026-08-17**, and are used
+as asked. They come with a cost that has to be paid rather than ignored:
+
+`#cf222e` against `#2da44e` measures **ΔE 7.2 under deuteranopia and 6.4 under tritanopia** —
+inside the 6–8 floor band, where a categorical pair is legal *only* if colour is not the sole
+carrier of the distinction. Roughly one man in twelve cannot reliably separate that pair, on
+cells whose entire job is separating three states. So **every classified cell carries a letter
+glyph — `R` for regulador, `P` for perturbador, blank for neither** — and the state is
+readable with the colour discarded entirely. At normal vision the pair is ΔE 33.5, so the
+figure is vivid for everyone else. This is the documented relief, not a workaround.
+
+The sound and oral-alone cells keep the existing blue/neutral pair (ΔE 37.8), which needs no
+secondary encoding, and grey `#b8b5ae` holds "neither" — a neutral by intent, which is why it
+does not meet the chroma floor a categorical hue would.
+
+```{r heat-palette}
+col_vs_present <- "#2a78d6"   # blue   - VS present (sound, oral alone)
+col_vs_absent  <- "#f0efec"   # light neutral - no VS
+col_regulador  <- "#2da44e"   # green  - Esther's choice
+col_perturbador<- "#cf222e"   # red    - Esther's choice
+col_neither    <- "#b8b5ae"   # grey   - neither label
+
+state_levels <- c("VS present", "No VS", "Regulador", "Perturbador", "Neither")
+state_cols <- c("VS present"  = col_vs_present, "No VS"       = col_vs_absent,
+                "Regulador"   = col_regulador,  "Perturbador" = col_perturbador,
+                "Neither"     = col_neither)
+
+oral_order <- inventory |> filter(block_type == "oral_plus_sound") |> arrange(e) |> pull(oral)
+
+theme_heat <- theme_minimal(base_size = 10) +
+  theme(
+    panel.grid      = element_blank(),
+    panel.spacing.x = unit(16, "pt"),
+    strip.clip      = "off",
+    axis.text.x     = element_text(angle = 90, vjust = 0.5, hjust = 1, colour = ink_muted),
+    axis.text.y     = element_text(size = 6.5, colour = ink_muted),
+    axis.title      = element_text(colour = ink_muted, size = 9),
+    strip.text      = element_text(colour = ink_primary, face = "bold", size = 9),
+    plot.title      = element_text(colour = ink_primary, face = "bold", size = 12),
+    plot.subtitle   = element_text(colour = ink_muted, size = 8.5),
+    plot.caption    = element_text(colour = ink_muted, size = 7, hjust = 0),
+    plot.background = element_rect(fill = surface, colour = NA),
+    legend.title    = element_blank(),
+    legend.text     = element_text(colour = ink_muted, size = 8)
+  )
+
+gap <- 0.35   # tile borders drawn in the surface colour ARE the gap between marks
+```
+
+Row order is shared by all three heatmaps so they can be read against each other: sound
+responders first (the block where regulador can occur), then by how many stimuli were
+regulador, then perturbador.
+
+```{r heat-order}
+ord <- classified |>
+  filter(block_type == "oral_plus_sound") |>
+  group_by(pid) |>
+  summarise(vs_sound = first(vs_sound),
+            n_reg  = sum(classification == "regulador"),
+            n_pert = sum(classification == "perturbador"), .groups = "drop") |>
+  arrange(desc(vs_sound), desc(n_reg), desc(n_pert))
+
+pid_levels <- rev(ord$pid)
+cat("row order: ", sum(ord$vs_sound == 1), " sound-responders on top, then ",
+    sum(ord$vs_sound == 0), "\n", sep = "")
+```
+
+## Sound, and the classification under sound + oral
+
+```{r heatmap-classification, fig.width=9, fig.height=8, dpi=300}
+heat_a <- classified |>
+  filter(block_type %in% c("sound_only", "oral_plus_sound")) |>
+  mutate(
+    state = case_when(
+      block_type == "sound_only" & any_vs == 1 ~ "VS present",
+      block_type == "sound_only" & any_vs == 0 ~ "No VS",
+      classification == "regulador"            ~ "Regulador",
+      classification == "perturbador"          ~ "Perturbador",
+      TRUE                                     ~ "Neither"
+    ),
+    glyph = case_when(state == "Regulador" ~ "R", state == "Perturbador" ~ "P", TRUE ~ ""),
+    panel = factor(if_else(block_type == "sound_only", "Sound alone", "Oral + sound"),
+                   levels = c("Sound alone", "Oral + sound")),
+    col_f = factor(if_else(block_type == "sound_only", "Sound", oral),
+                   levels = c("Sound", oral_order)),
+    pid_f = factor(pid, levels = pid_levels),
+    state = factor(state, levels = state_levels)
+  )
+
+p_heat_a <- ggplot(heat_a, aes(col_f, pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  geom_text(aes(label = glyph), size = 2, colour = "white", fontface = "bold") +
+  facet_grid(. ~ panel, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = state_cols, drop = FALSE) +
+  labs(
+    title    = "Sound response, and how each oral stimulus changed it",
+    subtitle = paste0("Sound alone: was there a pseudo-scotoma? Oral + sound: regulador (R), ",
+                      "perturbador (P) or neither, against that\nparticipant's own sound-only ",
+                      "result. n = ", n_total, "; each cell collapses 12 drawings."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "R and P are printed in every classified cell because red and green sit at ",
+      "deltaE 7.2 under deuteranopia - the state is readable without colour.\n",
+      "Eligibility is fixed by the sound column: only the ", n_sound,
+      " participants with a pseudo-scotoma under sound can be regulador, only the ", n_nosnd,
+      " without can be perturbador.\n",
+      "'Neither' merges no-change, partial improvement AND worsening. Rows ordered by sound ",
+      "response, then regulador count. Values in data/processed/participant_condition_long.csv"
+    )
+  ) +
+  theme_heat
+p_heat_a
+
+ggsave(file.path(fig, "heatmap_sound_and_classification.png"), p_heat_a,
+       width = 9, height = 8, dpi = 300, bg = surface)
+```
+
+## The oral stimuli alone, without sound
+
+```{r heatmap-oral-alone, fig.width=9, fig.height=8, dpi=300}
+heat_b <- classified |>
+  filter(block_type == "oral_alone") |>
+  mutate(
+    state = factor(if_else(any_vs == 1, "VS present", "No VS"), levels = state_levels),
+    col_f = factor(oral, levels = oral_order),
+    pid_f = factor(pid, levels = pid_levels)
+  )
+
+p_heat_b <- ggplot(heat_b, aes(col_f, pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  scale_fill_manual(values = state_cols, drop = TRUE, limits = c("VS present", "No VS")) +
+  labs(
+    title    = "Pseudo-scotoma under each oral stimulus alone, no sound",
+    subtitle = paste0("Headphones on, sound off. Same participants and same row order as the ",
+                      "previous figure, so the two can be read\nagainst each other. n = ",
+                      n_total, "; each cell collapses 12 drawings."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "No classification applies here: regulador and perturbador are defined only against ",
+      "the sound-only condition.\n",
+      "This phase always ran last, so a difference from the previous figure is confounded ",
+      "with time, fatigue and practice (ANALYSIS_PLAN.md 2a.1).\n",
+      "Values in data/processed/participant_condition_long.csv"
+    )
+  ) +
+  theme_heat
+p_heat_b
+
+ggsave(file.path(fig, "heatmap_oral_alone_vs.png"), p_heat_b,
+       width = 9, height = 8, dpi = 300, bg = surface)
+```
+
+## Elimination only, in the 23 sound-responders
+
+Added 2026-08-18 for the client summary, which reports the elimination endpoint and does not
+report `perturbador`. This figure is the elimination endpoint and nothing else: rows are the
+`r sum(sound_only$vs_sound == 1)` participants who reported a pseudo-scotoma under sound alone
+— the only people for whom "elimination" is a question — and each oral cell is a two-state
+answer.
+
+Restricting the rows is what removes `perturbador` from the figure entirely: the label is
+defined only for participants with **no** VS under sound, and none of them is in this figure.
+So no cell here is ambiguous and no legend entry goes unused.
+
+```{r heatmap-elimination, fig.width=9, fig.height=6.5, dpi=300}
+elim_pids <- sound_only |> filter(vs_sound == 1) |> pull(pid)
+stopifnot(length(elim_pids) == n_sound)
+
+elim_order <- classified |>
+  filter(block_type == "oral_plus_sound", pid %in% elim_pids) |>
+  group_by(pid) |>
+  summarise(n_elim = sum(classification == "regulador"), .groups = "drop") |>
+  arrange(desc(n_elim))
+
+col_eliminated <- "#2da44e"   # green - VS cleared, Esther's choice, kept from the R/P figure
+elim_levels <- c("VS present", "Eliminated", "VS persists")
+elim_cols <- c("VS present" = col_vs_present, "Eliminated" = col_eliminated,
+               "VS persists" = col_vs_present)
+
+heat_e <- classified |>
+  filter(pid %in% elim_pids, block_type %in% c("sound_only", "oral_plus_sound")) |>
+  mutate(
+    state = case_when(
+      block_type == "sound_only"  ~ "VS present",
+      classification == "regulador" ~ "Eliminated",
+      TRUE                          ~ "VS persists"
+    ),
+    glyph = if_else(state == "Eliminated", "E", ""),
+    panel = factor(if_else(block_type == "sound_only", "Sound alone", "Sound + OPS"),
+                   levels = c("Sound alone", "Sound + OPS")),
+    col_f = factor(if_else(block_type == "sound_only", "Sound", oral),
+                   levels = c("Sound", oral_order)),
+    pid_f = factor(pid, levels = rev(elim_order$pid)),
+    state = factor(state, levels = elim_levels)
+  )
+
+# The figure must carry the published endpoint, or it is not the figure it claims to be.
+n_ever_elim <- heat_e |>
+  filter(block_type == "oral_plus_sound") |>
+  group_by(pid) |>
+  summarise(any_e = any(state == "Eliminated"), .groups = "drop") |>
+  summarise(k = sum(any_e)) |>
+  pull(k)
+stopifnot(n_ever_elim == 18, n_sound == 23)
+
+p_heat_e <- ggplot(heat_e, aes(col_f, pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  geom_text(aes(label = glyph), size = 2.2, colour = "white", fontface = "bold") +
+  facet_grid(. ~ panel, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = elim_cols, breaks = c("VS present", "Eliminated"),
+                    labels = c("Pseudo-scotoma present", "Pseudo-scotoma eliminated (E)")) +
+  labs(
+    title    = "Elimination of sound-induced pseudo-scotomas, by individual oral stimulus",
+    subtitle = paste0("The ", n_sound, " participants who reported a pseudo-scotoma under sound ",
+                      "alone. Green indicates that the pseudo-scotoma was\nabsent from all 12 ",
+                      "drawings under that stimulus while the sound was maintained. ",
+                      n_ever_elim, " of ", n_sound,
+                      " participants responded to at least\none stimulus, and the effective ",
+                      "stimulus differed between individuals."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "OPS = oral proprioceptive stimuli. M1-M3 are combined oral stimuli; the remaining ",
+      "eight are dental stimuli, labelled by tooth (FDI notation)\n",
+      "and site (V = buccal, P = palatal, L = lingual). E is printed in every green cell so ",
+      "that the two states are distinguishable without colour.\n",
+      "Participants are ordered by the number of effective stimuli; the five participants at ",
+      "the foot responded to none. Blue merges no change,\n",
+      "partial improvement and worsening. The sound condition was presented once, so the rate ",
+      "at which a pseudo-scotoma resolves\n",
+      "spontaneously on re-testing could not be estimated."
+    )
+  ) +
+  theme_heat +
+  theme(legend.title = element_blank())
+p_heat_e
+
+ggsave(file.path(fig, "heatmap_elimination.png"), p_heat_e,
+       width = 9, height = 6.5, dpi = 300, bg = surface)
+```
+
+### The same endpoint collapsed across the eleven stimuli
+
+Added 2026-08-18. Same 23 participants and same row order as the figure above, reduced to the
+question the published endpoint asks: **did *any* oral stimulus clear it?** Two states, nothing
+else printed in the cells.
+
+⚠️ **This figure is written for the manuscript**, so the caption carries no path, no filename and
+no cross-reference to the analysis plan — a reader of the paper cannot follow any of those. The
+one caveat that must survive is the opportunity asymmetry, and it is stated in words a journal
+reader can act on.
+
+```{r heatmap-elimination-collapsed, fig.width=6.5, fig.height=6.5, dpi=300}
+elim_collapsed <- classified |>
+  filter(pid %in% elim_pids, block_type == "oral_plus_sound") |>
+  group_by(pid) |>
+  summarise(n_elim = sum(classification == "regulador"), .groups = "drop") |>
+  transmute(
+    pid,
+    `Sound alone` = "VS present",
+    `Sound + OPS` = if_else(n_elim > 0, "Eliminated", "VS persists")
+  ) |>
+  pivot_longer(-pid, names_to = "col", values_to = "state") |>
+  mutate(
+    state = factor(state, levels = elim_levels),
+    col_f = factor(col, levels = c("Sound alone", "Sound + OPS")),
+    pid_f = factor(pid, levels = rev(elim_order$pid))
+  )
+
+stopifnot(sum(elim_collapsed$state == "Eliminated") == 18)
+
+p_elim_c <- ggplot(elim_collapsed, aes(col_f, pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  scale_fill_manual(values = elim_cols, breaks = c("VS present", "Eliminated"),
+                    labels = c("Pseudo-scotoma present", "Pseudo-scotoma eliminated")) +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "Elimination of sound-induced pseudo-scotomas",
+    subtitle = paste0("Each row is one of the ", n_sound, " participants who reported a ",
+                      "pseudo-scotoma under sound\nalone. Green indicates that the ",
+                      "pseudo-scotoma was absent from all 12 drawings\nunder at least one OPS ",
+                      "condition while the sound was maintained (", n_ever_elim, "/", n_sound,
+                      "; 78.3%)."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "OPS = oral proprioceptive stimuli. The OPS column summarises 11 stimulus conditions,\n",
+      "whereas the sound condition was presented once; the two columns therefore differ in\n",
+      "the number of opportunities for a pseudo-scotoma to be recorded and are not a\n",
+      "like-for-like comparison. Blue in the right-hand column merges no change, partial\n",
+      "improvement and worsening."
+    )
+  ) +
+  theme_heat +
+  theme(legend.title = element_blank(),
+        axis.text.x  = element_text(angle = 0, hjust = 0.5, vjust = 1, size = 8.5))
+p_elim_c
+
+ggsave(file.path(fig, "heatmap_elimination_collapsed.png"), p_elim_c,
+       width = 6.5, height = 6.5, dpi = 300, bg = surface)
+```
+
+## Collapsed across stimuli — three columns
+
+Each participant reduced to one value per condition type. The collapse rules are Esther's:
+any regulador → regulador; any perturbador → perturbador; any VS under an oral stimulus
+alone → VS present.
+
+**The two classification rules cannot collide.** Eligibility is fixed by `E1`, so a
+participant who can be regulador can never be perturbador, whatever the eleven stimuli did.
+That is asserted below rather than assumed — if it ever fails, the collapse is ambiguous and
+the figure is wrong.
+
+```{r heatmap-collapsed, fig.width=7, fig.height=8, dpi=300}
+collapsed <- classified |>
+  group_by(pid) |>
+  summarise(
+    sound_vs = first(any_vs[block_type == "sound_only"]),
+    any_reg  = any(classification[block_type == "oral_plus_sound"] == "regulador"),
+    any_pert = any(classification[block_type == "oral_plus_sound"] == "perturbador"),
+    oral_vs  = as.integer(any(any_vs[block_type == "oral_alone"] == 1)),
+    .groups  = "drop"
+  )
+
+stopifnot(!any(collapsed$any_reg & collapsed$any_pert))
+stopifnot(nrow(collapsed) == n_total)
+
+cat("collapsed: VS under sound", sum(collapsed$sound_vs), "| any regulador",
+    sum(collapsed$any_reg), "| any perturbador", sum(collapsed$any_pert),
+    "| VS under any oral stimulus alone", sum(collapsed$oral_vs), "\n")
+
+heat_c <- collapsed |>
+  transmute(
+    pid,
+    `Sound\nalone` = if_else(sound_vs == 1, "VS present", "No VS"),
+    `Sound + oral\n(any stimulus)` = case_when(any_reg ~ "Regulador",
+                                               any_pert ~ "Perturbador",
+                                               TRUE ~ "Neither"),
+    `Oral alone\n(any stimulus)` = if_else(oral_vs == 1, "VS present", "No VS")
+  ) |>
+  pivot_longer(-pid, names_to = "col", values_to = "state") |>
+  mutate(
+    glyph = case_when(state == "Regulador" ~ "R", state == "Perturbador" ~ "P", TRUE ~ ""),
+    state = factor(state, levels = state_levels),
+    col_f = factor(col, levels = c("Sound\nalone", "Sound + oral\n(any stimulus)",
+                                   "Oral alone\n(any stimulus)")),
+    pid_f = factor(pid, levels = pid_levels)
+  )
+
+p_heat_c <- ggplot(heat_c, aes(col_f, pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  geom_text(aes(label = glyph), size = 2.4, colour = "white", fontface = "bold") +
+  scale_fill_manual(values = state_cols, drop = FALSE) +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "One value per participant per condition type",
+    subtitle = paste0("Collapsed across the eleven oral stimuli. n = ", n_total, "."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "Collapse rules: any regulador -> regulador; any perturbador -> perturbador;\n",
+      "any pseudo-scotoma under an oral stimulus alone -> VS present.\n",
+      "A participant can never be both labels, because eligibility is fixed by the\n",
+      "sound column, so the middle column is never ambiguous.\n",
+      "The middle column is a disjunction over 11 stimuli x 12 drawings = 132 binary\n",
+      "cells; see ANALYSIS_PLAN.md 2a.9 before reading a rate off it.\n",
+      "Values in data/processed/participant_condition_summary.csv"
+    )
+  ) +
+  theme_heat +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 1, size = 7.5))
+p_heat_c
+
+ggsave(file.path(fig, "heatmap_collapsed_three_conditions.png"), p_heat_c,
+       width = 7, height = 8, dpi = 300, bg = surface)
+```
+
+## Collapsed presence only — the three phases side by side
+
+Added 2026-08-18 for the client summary, which reports prevalence and does not report
+`perturbador`. Same three columns as the figure above, but every cell answers the **same**
+yes/no question, so the three phases are read on one scale and no cell carries a classification.
+
+**The three phases are separated into their own panels** rather than sitting as three adjacent
+columns, so the eye does not read them as one continuous block, and the phase name sits above its
+own column instead of on a crowded axis. Also written for the manuscript: no internal paths or
+plan references in the caption.
+
+```{r heatmap-collapsed-presence, fig.width=6.5, fig.height=8, dpi=300}
+phase_labels <- c("Sound alone", "Sound + OPS", "OPS only")
+
+presence_c <- classified |>
+  group_by(pid) |>
+  summarise(
+    `Sound alone` = first(any_vs[block_type == "sound_only"]),
+    `Sound + OPS` = as.integer(any(any_vs[block_type == "oral_plus_sound"] == 1)),
+    `OPS only`    = as.integer(any(any_vs[block_type == "oral_alone"] == 1)),
+    .groups = "drop"
+  )
+
+col_totals <- colSums(presence_c[-1])
+stopifnot(col_totals == c(23, 34, 31), names(presence_c)[-1] == phase_labels)
+pct <- round(100 * col_totals / n_total, 1)
+
+heat_p <- presence_c |>
+  pivot_longer(-pid, names_to = "phase", values_to = "vs") |>
+  mutate(
+    state   = factor(if_else(vs == 1, "VS present", "No VS"), levels = state_levels),
+    phase_f = factor(phase, levels = phase_labels),
+    pid_f   = factor(pid, levels = pid_levels)
+  )
+
+p_presence <- ggplot(heat_p, aes(x = 1, y = pid_f, fill = state)) +
+  geom_tile(colour = surface, linewidth = gap) +
+  # One panel per phase, so the phases are visibly separate blocks with the name on top.
+  facet_grid(. ~ phase_f) +
+  scale_fill_manual(values = state_cols, breaks = "VS present",
+                    labels = "Pseudo-scotoma reported") +
+  scale_x_continuous(breaks = NULL, expand = expansion(0)) +
+  labs(
+    title    = "Prevalence of visual pseudo-scotomas by experimental phase",
+    subtitle = paste0("One value per participant per phase (n = ", n_total, "). Sound alone ",
+                      col_totals[1], "/", n_total, " (", pct[1], "%); sound + OPS ",
+                      col_totals[2], "/", n_total, " (", pct[2], "%);\nOPS only ", col_totals[3],
+                      "/", n_total, " (", pct[3], "%)."),
+    x = NULL, y = "Participant",
+    caption = paste0(
+      "OPS = oral proprioceptive stimuli. The sound + OPS and OPS only phases each comprise\n",
+      "11 stimulus conditions, whereas sound alone was presented once; the phase totals\n",
+      "therefore reflect the number of conditions applied as well as the stimuli themselves,\n",
+      "and are not a like-for-like comparison. The OPS only phase was always performed last,\n",
+      "so differences between phases are confounded with time, fatigue and practice."
+    )
+  ) +
+  theme_heat +
+  theme(legend.title    = element_blank(),
+        panel.spacing.x = unit(22, "pt"),
+        strip.text      = element_text(colour = ink_primary, face = "bold", size = 9.5))
+p_presence
+
+ggsave(file.path(fig, "heatmap_vs_binary_collapsed.png"), p_presence,
+       width = 6.5, height = 8, dpi = 300, bg = surface)
+```
+
+```{r session}
+sessionInfo()
+```
