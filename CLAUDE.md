@@ -18,11 +18,12 @@ Study1/
 ├── RESEARCH_QUESTIONS.xlsx        ⚠️ seeded from the template, NOT YET FILLED
 ├── data/raw/                      the TFG Excel + the Spanish recount. Read-only.
 ├── data/processed/
-└── 01_audiovisual_integration/
-    ├── ANALYSIS_PLAN.md
-    ├── src/  outputs/
-    └── Manuscript/{MANUSCRIPT.md, drafts/, submitted/, revisions/}
+└── 01_audiovisual_integration/    the question folder
 ```
+
+What a question folder holds (the plan, the deviations and review logs, the publishability
+worksheet and planned numbers, `src/`, `outputs/`, `Manuscript/`) is set once, in the root
+`../CLAUDE.md`, and not repeated here.
 
 Only one study and one question so far. `Study1` is the folder Esther received; it is a
 data collection, not an analysis.

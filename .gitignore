@@ -116,15 +116,17 @@ Desktop.ini
 # Other small reference tables worth versioning can be force-added:
 #   git add -f path/to/file.csv
 
-# --- data and outputs never enter git (added 2026-11-10) ---
+# --- data and outputs never enter git (added 2026-11-10), except outputs/numbers/ ---
 .claude/worktrees/
-**/outputs/
+**/outputs/*
+!**/outputs/numbers/
 **/data/**
 !**/data/**/
 !**/data/**/README.md
 !**/data/**/*.R
 !**/data/**/*.r
 *.csv
+!**/outputs/numbers/*.csv
 *.sav
 *.rds
 *.RData
